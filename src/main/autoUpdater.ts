@@ -2,6 +2,7 @@ import { autoUpdater } from 'electron-updater'
 import { ipcMain, app, BrowserWindow } from 'electron'
 import { createRequire } from 'module'
 import { createLogger } from './logger'
+import { classifyUpdateError } from '../shared/updateErrors'
 
 const log = createLogger('AutoUpdate')
 
@@ -148,6 +149,18 @@ export function initAutoUpdater(): void {
   })
 
   autoUpdater.on('error', (err) => {
+    // A build with no publish target carries no app-update.yml, so this fires
+    // on the very first check and pinned Settings to a red "Update failed"
+    // showing a raw ENOENT path. Nothing the user can act on, and guaranteed
+    // for every locally-built installer - presenting it as an error trains
+    // them to ignore the one place a real update problem would show up.
+    if (classifyUpdateError(err.message) === 'not-configured') {
+      log.info('No update channel in this build - update checks disabled')
+      clearUpToDateTimer()
+      state = { status: 'idle' }
+      broadcastState()
+      return
+    }
     log.error('Auto-update error:', err.message)
     state = { status: 'error', error: err.message }
     broadcastState()
@@ -169,7 +182,16 @@ export function initAutoUpdater(): void {
       await autoUpdater.checkForUpdates()
       return { success: true }
     } catch (err) {
-      return { success: false, error: String(err) }
+      const message = err instanceof Error ? err.message : String(err)
+      // Same reasoning as the error handler: report "no channel in this build"
+      // the way the dev case is reported, rather than as a failed update.
+      if (classifyUpdateError(message) === 'not-configured') {
+        clearUpToDateTimer()
+        state = { status: 'idle' }
+        broadcastState()
+        return { success: true, skipped: 'not-configured' }
+      }
+      return { success: false, error: message }
     }
   })
 
