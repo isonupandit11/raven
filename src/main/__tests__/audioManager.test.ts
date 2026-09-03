@@ -548,11 +548,34 @@ describe('AudioManager', () => {
   })
 
   describe('stopRecordingInternal', () => {
-    it('shows and focuses dashboard after stopping', async () => {
+    it('does NOT raise the dashboard after stopping (overlay-first default)', async () => {
       const showFn = vi.fn()
       const focusFn = vi.fn()
       const dashboard = { isDestroyed: () => false, webContents: { send: vi.fn() }, show: showFn, focus: focusFn } as any
       manager.setWindows(dashboard, null)
+
+      const startHandler = mockIpcHandlers['audio:start-recording']
+      await startHandler({})
+
+      const stopHandler = mockIpcHandlers['audio:stop-recording']
+      await stopHandler()
+
+      // This used to fire on EVERY stop, including TRANSCRIPTION_FAILED and
+      // the auto-stop paths, so a dropped transcription mid-call popped a
+      // window and stole focus while the user was on camera. The overlay
+      // already learns about the stop via broadcastRecordingState().
+      expect(showFn).not.toHaveBeenCalled()
+      expect(focusFn).not.toHaveBeenCalled()
+    })
+
+    it('shows and focuses dashboard after stopping when showDashboardOnSessionEnd is set', async () => {
+      const showFn = vi.fn()
+      const focusFn = vi.fn()
+      const dashboard = { isDestroyed: () => false, webContents: { send: vi.fn() }, show: showFn, focus: focusFn } as any
+      manager.setWindows(dashboard, null)
+      mockGetSetting.mockImplementation((key: string) =>
+        key === 'showDashboardOnSessionEnd' ? true : '',
+      )
 
       const startHandler = mockIpcHandlers['audio:start-recording']
       await startHandler({})

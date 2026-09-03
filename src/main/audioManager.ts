@@ -53,6 +53,12 @@ export class AudioManager {
   private transcriptionService: TranscriptionService
   private activeProvider: TranscriptionProvider | null = null
   private usingAssemblyAI = false
+  /**
+   * A transcription failure that retrying cannot fix (no credit, rejected key,
+   * quota), carried across retry attempts so the message shown when retries run
+   * out names the actual cause instead of "all providers failed".
+   */
+  private lastPermanentSttFailure: { title: string; body: string } | null = null
   private sessionTimer: ReturnType<typeof setTimeout> | null = null
   private transcriptionStartupAbort: AbortController | null = null
   private transcriptionRetryTimer: ReturnType<typeof setTimeout> | null = null
@@ -383,9 +389,19 @@ export class AudioManager {
       })
     }
 
-    if (this.dashboardWindow && !this.dashboardWindow.isDestroyed()) {
-      this.dashboardWindow.show()
-      this.dashboardWindow.focus()
+    // Overlay-first UX: never raise the dashboard on our own. This fired on
+    // EVERY stop — including TRANSCRIPTION_FAILED and the auto-stop paths — so
+    // a dropped transcription mid-call popped a window and stole focus while
+    // the user was on camera, which is the worst failure mode for a tool whose
+    // whole point is staying unseen. Nothing is lost: the overlay already gets
+    // broadcastRecordingState() above and, on failure,
+    // broadcastTranscriptionConnectionState() just before this.
+    // Set showDashboardOnSessionEnd to restore the old behavior.
+    if (getSetting('showDashboardOnSessionEnd')) {
+      if (this.dashboardWindow && !this.dashboardWindow.isDestroyed()) {
+        this.dashboardWindow.show()
+        this.dashboardWindow.focus()
+      }
     }
     log.info(
       `Recording stopped (${opts.reason}). Chunks: ${this.chunkCount}, Duration: ${Math.round(duration / 1000)}s`
@@ -396,6 +412,9 @@ export class AudioManager {
   private async startProTranscriptionWithRetries(): Promise<void> {
     // Cancel any previous loop
     this.clearTranscriptionRetryLoop()
+    // Clear last session's cause, or a resolved billing problem would keep
+    // being reported as the reason for an unrelated later failure.
+    this.lastPermanentSttFailure = null
     this.transcriptionStartupAbort = new AbortController()
     const { signal } = this.transcriptionStartupAbort
 
@@ -427,7 +446,10 @@ export class AudioManager {
       stopIfAborted()
 
       // 1) AssemblyAI
-      let aaiService: { stop: () => Promise<void> } | null = null
+      let aaiService: {
+        stop: () => Promise<void>
+        getPermanentFailure?: () => { title: string; body: string } | null
+      } | null = null
       try {
         this.broadcastTranscriptionConnectionState({
           phase: 'connecting',
@@ -462,6 +484,11 @@ export class AudioManager {
           return { ok: true }
         }
 
+        // Lift the reason out before this instance goes out of scope. The
+        // connect timeout fires long after the websocket already reported the
+        // real cause, so by the time retries are exhausted this is the only
+        // place that still knows it was, say, "insufficient funds".
+        this.lastPermanentSttFailure = service.getPermanentFailure() ?? this.lastPermanentSttFailure
         try { await service.stop() } catch { /* ignore */ }
       } catch (err) {
         if (err instanceof Error && err.message === 'CONNECT_TIMEOUT') {
@@ -472,6 +499,8 @@ export class AudioManager {
           log.warn('AssemblyAI connect failed:', err)
         }
         if (aaiService) {
+          this.lastPermanentSttFailure =
+            aaiService.getPermanentFailure?.() ?? this.lastPermanentSttFailure
           try { await aaiService.stop() } catch { /* ignore */ }
         }
       }
@@ -537,6 +566,23 @@ export class AudioManager {
 
       if (retries >= maxRetries) {
         log.error('All transcription providers failed after retries - auto-stopping recording')
+        // Repeat the provider's own diagnosis. AssemblyAI said "Unauthorized
+        // Connection: Insufficient funds" and the user was shown nothing at
+        // all - the recording just stopped, which reads as the app being
+        // broken rather than an account needing credit. A permanent cause is
+        // the only kind worth naming here; a transient one has already been
+        // retried to death and "the network failed repeatedly" is not
+        // actionable.
+        const permanent = this.lastPermanentSttFailure
+        if (permanent) {
+          this.broadcastError(permanent.title, permanent.body)
+        } else {
+          this.broadcastError(
+            'Transcription unavailable',
+            'Could not reach any transcription provider after several attempts. '
+            + 'Check your connection and API keys in Settings.',
+          )
+        }
         await this.stopRecordingInternal({ reason: 'TRANSCRIPTION_FAILED' })
         return
       }

@@ -31,6 +31,12 @@ type ProcessedAudioCallback = (buffer: Buffer, source: AudioSource) => void
 type CaptureProcess = ChildProcessByStdio<null, Readable, Readable>
 
 let systemChunkCount = 0
+// Chunks WASAPI delivered that we threw away because captureSystemAudio is off.
+// Tracked separately because dropping them before systemChunkCount++ made a
+// disabled setting log "system: true (0 chunks)" - byte-identical to "loopback
+// handed us nothing at all". Same symptom, completely different fix: one is a
+// toggle, the other is an idle render endpoint or a broken device.
+let systemDroppedCount = 0
 let micChunkCount = 0
 let captureProcess: CaptureProcess | null = null
 let windowsModule: WindowsAudioModule | null = null
@@ -495,6 +501,7 @@ function loadWindowsModule(): WindowsAudioModule | null {
 export function startCapture(): boolean {
   captureStopping = false
   systemChunkCount = 0
+  systemDroppedCount = 0
   micChunkCount = 0
   residualEchoDrops = 0
   residualSpeechPasses = 0
@@ -521,7 +528,17 @@ export function stopCapture(): boolean {
 
 function handleSystemChunk(audioData: Buffer): void {
   if (captureStopping) return
-  if (getSetting('captureSystemAudio') === false) return
+  if (getSetting('captureSystemAudio') === false) {
+    systemDroppedCount++
+    // Once per run, not per chunk - this fires every few milliseconds.
+    if (systemDroppedCount === 1) {
+      log.warn(
+        'Discarding system audio: captureSystemAudio is off. '
+        + 'The other party will not be transcribed. Dashboard > Settings > Audio.',
+      )
+    }
+    return
+  }
 
   systemChunkCount++
   if (systemChunkCount <= 5 || systemChunkCount % 100 === 0) {
@@ -824,8 +841,17 @@ function stopWindowsCapture(): boolean {
   const systemStopped = mod.stopSystemAudioCapture()
   const micStopped = mod.stopMicCapture()
   expectingCaptureExit = false
+  // Spell out WHY system chunks are zero. Unqualified "0 chunks" has three
+  // very different causes: the setting is off, nothing was playing (WASAPI
+  // loopback yields no packets at all when the render endpoint is idle), or the
+  // device genuinely failed.
+  const systemDetail = systemDroppedCount > 0
+    ? `${systemChunkCount} chunks, ${systemDroppedCount} discarded because captureSystemAudio is off`
+    : systemChunkCount === 0
+      ? '0 chunks - nothing was playing, or the loopback device produced no packets'
+      : `${systemChunkCount} chunks`
   log.info(
-    `Windows capture stopped - system: ${systemStopped} (${systemChunkCount} chunks), mic: ${micStopped} (${micChunkCount} chunks)`
+    `Windows capture stopped - system: ${systemStopped} (${systemDetail}), mic: ${micStopped} (${micChunkCount} chunks)`
   )
   return evaluateWindowsCaptureStop({ systemStopped, micStopped })
 }

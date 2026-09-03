@@ -1,21 +1,40 @@
 /**
- * AssemblyAI Transcription Service.
- * Mints temporary tokens from the user's own AssemblyAI key.
- * Creates two RealtimeTranscriber instances: one for mic, one for system audio.
- * Falls back to Deepgram on failure (handled by AudioManager).
+ * AssemblyAI Transcription Service (v3 Streaming API).
+ *
+ * Creates two StreamingTranscriber instances - one for mic, one for system
+ * audio - authenticating with the user's own key. Falls back to Deepgram on
+ * failure (handled by AudioManager).
+ *
+ * MIGRATED FROM v2. This used RealtimeTranscriber and minted a temporary token
+ * via client.realtime.createTemporaryToken(), which POSTs /v2/realtime/token -
+ * an endpoint AssemblyAI has retired. Newer accounts get 404 Not found there
+ * (note: not 401, so it was never a bad-key problem), the token step returned
+ * null, and start() bailed straight to the Deepgram fallback - which then found
+ * no Deepgram key and stopped transcription entirely. Symptom: a recording that
+ * captured audio fine and produced no transcript at all.
+ *
+ * The token subsystem is gone rather than ported. Temporary tokens exist so a
+ * BROWSER can connect without shipping the API key to the client; this service
+ * runs in the main process, where the key already lives, so
+ * StreamingTranscriberParams.apiKey connects directly. That removes the 480s
+ * token TTL, the refresh timer, the mid-session reconnect-with-new-token dance,
+ * and the second-token round trip the dual-stream setup needed - four moving
+ * parts whose only purpose was working around a constraint that does not apply
+ * here.
  */
 
 import { BrowserWindow } from 'electron'
-import { RealtimeTranscriber } from 'assemblyai'
+import { StreamingTranscriber, AssemblyAI } from 'assemblyai'
 import { createLogger } from '../logger'
 import { getApiKey, getSetting } from '../store'
 import { sessionManager } from './sessionManager'
 import { AUDIO_SAMPLE_RATE, TRANSCRIPT_MERGE_WINDOW_MS } from '../constants'
+import { resolveTurnAction, flushPendingTurn, type PendingTurn } from './assemblyaiTurns'
+import { classifySttFailure } from './sttFailure'
 
 const log = createLogger('AssemblyAI')
 
 const MAX_RECONNECT_ATTEMPTS = 5
-const TOKEN_REFRESH_BUFFER_MS = 60_000
 const MAX_TRANSCRIPT_ENTRIES = 5000
 
 type AudioSource = 'mic' | 'system'
@@ -30,43 +49,28 @@ interface TranscriptEntry {
 }
 
 interface TranscriberState {
-  transcriber: RealtimeTranscriber | null
+  transcriber: StreamingTranscriber | null
   isConnected: boolean
   currentInterim: string
   reconnectAttempts: number
   reconnecting: boolean
-}
-
-const ASSEMBLYAI_TOKEN_TTL = 480
-
-async function fetchTranscriptionToken(): Promise<{ token: string; expiresIn: number } | null> {
-  const apiKey = getApiKey('assemblyaiApiKey')
-  if (!apiKey) {
-    log.warn('No AssemblyAI API key in store')
-    return null
-  }
-  try {
-    const { AssemblyAI } = await import('assemblyai')
-    const client = new AssemblyAI({ apiKey })
-    const token = await client.realtime.createTemporaryToken({
-      expires_in: ASSEMBLYAI_TOKEN_TTL,
-    })
-    return { token, expiresIn: ASSEMBLYAI_TOKEN_TTL }
-  } catch (err) {
-    log.error('Failed to create AssemblyAI transcription token:', err)
-    return null
-  }
+  /**
+   * An unformatted end-of-turn held until its formatted version arrives. See
+   * assemblyaiTurns.ts - finalizing both copies would duplicate the sentence,
+   * because handleFinalTranscript merges consecutive same-speaker entries.
+   */
+  pendingTurn: PendingTurn | null
 }
 
 export class AssemblyAITranscriptionService {
-  private micState: TranscriberState = { transcriber: null, isConnected: false, currentInterim: '', reconnectAttempts: 0, reconnecting: false }
-  private systemState: TranscriberState = { transcriber: null, isConnected: false, currentInterim: '', reconnectAttempts: 0, reconnecting: false }
+  private micState: TranscriberState = { transcriber: null, isConnected: false, currentInterim: '', reconnectAttempts: 0, reconnecting: false, pendingTurn: null }
+  private systemState: TranscriberState = { transcriber: null, isConnected: false, currentInterim: '', reconnectAttempts: 0, reconnecting: false, pendingTurn: null }
   private overlayWindow: BrowserWindow | null = null
   private dashboardWindow: BrowserWindow | null = null
   private transcriptEntries: TranscriptEntry[] = []
   private isActive = false
-  private tokenExpiresAt = 0
-  private tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null
+  private aborting = false
+  private permanentFailure: ReturnType<typeof classifySttFailure> | null = null
   private onFallback: (() => Promise<void>) | null = null
 
   setWindows(dashboard: BrowserWindow | null, overlay: BrowserWindow | null): void {
@@ -79,24 +83,26 @@ export class AssemblyAITranscriptionService {
   }
 
   async start(): Promise<{ success: boolean; error?: string; fallback?: boolean }> {
-    const tokenResult = await fetchTranscriptionToken()
-    if (!tokenResult) {
-      log.warn('No AssemblyAI token - triggering fallback')
-      return { success: false, fallback: true, error: 'Could not create transcription session' }
+    const apiKey = getApiKey('assemblyaiApiKey')
+    if (!apiKey) {
+      log.warn('No AssemblyAI API key in store - triggering fallback')
+      return { success: false, fallback: true, error: 'No AssemblyAI API key configured' }
     }
 
-    log.info('Starting AssemblyAI transcription...')
+    log.info('Starting AssemblyAI transcription (v3 streaming)...')
     this.isActive = true
-    this.tokenExpiresAt = Date.now() + (tokenResult.expiresIn * 1000)
-    this.scheduleTokenRefresh(tokenResult.expiresIn)
+    this.permanentFailure = null
 
-    // Temporary tokens are minted from the user's AssemblyAI key.
+    // Both streams authenticate with the same key. Under v2 each connection
+    // needed its own single-use temporary token, so the system stream had to
+    // fetch a second one and could fail independently of the mic; with a direct
+    // key there is nothing to run out of.
     // Speech-model selection for the Recall path lives in
-    // transcriptProviderRouting; this native-capture path uses
-    // AssemblyAI's default streaming model for the token session.
+    // transcriptProviderRouting; this native-capture path uses AssemblyAI's
+    // default streaming model.
     const [micResult, systemResult] = await Promise.all([
-      this.startTranscriber('mic', tokenResult.token),
-      this.startTranscriber('system', tokenResult.token),
+      this.startTranscriber('mic', apiKey),
+      this.startTranscriber('system', apiKey),
     ])
 
     if (!micResult.success && !systemResult.success) {
@@ -111,42 +117,52 @@ export class AssemblyAITranscriptionService {
 
   private async startTranscriber(
     source: AudioSource,
-    token: string,
+    apiKey: string,
   ): Promise<{ success: boolean }> {
     const state = source === 'mic' ? this.micState : this.systemState
 
     try {
-      // Each token is one-time use, but for the dual-stream setup we need
-      // separate tokens. The first call uses the provided token; for the
-      // second stream, we fetch a new one.
-      let actualToken = token
-      if (source === 'system') {
-        const secondToken = await fetchTranscriptionToken()
-        if (secondToken) {
-          actualToken = secondToken.token
-        } else {
-          log.warn('Could not get second token for system audio')
-          return { success: false }
-        }
-      }
-
-      state.transcriber = new RealtimeTranscriber({
-        token: actualToken,
+      // Built through the client's factory rather than `new StreamingTranscriber`
+      // so the SDK owns the websocket base URL - it points at
+      // streaming.assemblyai.com/v3/ws, which is the whole reason this service
+      // was rewritten.
+      const client = new AssemblyAI({ apiKey })
+      state.pendingTurn = null
+      state.transcriber = client.streaming.transcriber({
+        apiKey,
         sampleRate: AUDIO_SAMPLE_RATE,
         encoding: 'pcm_s16le',
-        endUtteranceSilenceThreshold: 500,
+        // Punctuated, cased output. This makes each turn end twice (once raw,
+        // once formatted), which resolveTurnAction exists to disentangle.
+        formatTurns: true,
       })
 
-      state.transcriber.on('transcript', (transcript) => {
-        if (transcript.message_type === 'FinalTranscript' && transcript.text) {
-          this.handleFinalTranscript(transcript.text, source)
-        } else if (transcript.message_type === 'PartialTranscript' && transcript.text) {
-          this.handlePartialTranscript(transcript.text, source)
+      state.transcriber.on('turn', (event) => {
+        const decision = resolveTurnAction(event, state.pendingTurn)
+        state.pendingTurn = decision.pending
+        for (const finalText of decision.finalize) {
+          this.handleFinalTranscript(finalText, source)
+        }
+        // '' is meaningful - it clears a stale interim once a turn is final -
+        // so only null means "leave the interim alone".
+        if (decision.partial !== null) {
+          this.handlePartialTranscript(decision.partial, source)
         }
       })
 
       state.transcriber.on('error', (err) => {
         log.error(`[${source.toUpperCase()}] AssemblyAI error:`, err)
+        // A permanent condition - no credit, rejected key, quota - fails
+        // identically on every retry. Reconnecting through it burned 50 seconds
+        // across two streams and then reported a generic "all providers
+        // failed", so the provider's own diagnosis never reached the user.
+        const failure = classifySttFailure(err)
+        if (failure.kind === 'permanent') {
+          log.error(`[${source.toUpperCase()}] Permanent failure - not retrying: ${failure.title}`)
+          this.permanentFailure = failure
+          void this.abortToFallback()
+          return
+        }
         if (this.isActive) {
           this.handleDisconnect(source)
         }
@@ -155,6 +171,11 @@ export class AssemblyAITranscriptionService {
       state.transcriber.on('close', (_code: number, _reason: string) => {
         log.warn(`[${source.toUpperCase()}] AssemblyAI closed`)
         state.isConnected = false
+        // Without this the last sentence of a session is lost every time the
+        // connection closes between a speaker finishing and the formatted turn
+        // arriving - i.e. whenever the user stops recording right after the
+        // other person stops talking.
+        this.flushPending(source)
         if (this.isActive) {
           this.handleDisconnect(source)
         }
@@ -170,6 +191,33 @@ export class AssemblyAITranscriptionService {
       log.error(`[${source.toUpperCase()}] AssemblyAI connect failed:`, err)
       return { success: false }
     }
+  }
+
+  /**
+   * Give up immediately and hand over to the fallback provider.
+   *
+   * Separate from handleDisconnect because that path is built around retrying;
+   * there is nothing to retry here. Guarded so the mic and system streams -
+   * which both receive the same permanent error, milliseconds apart - do not
+   * each tear the service down.
+   */
+  private async abortToFallback(): Promise<void> {
+    if (!this.isActive || this.aborting) return
+    this.aborting = true
+    this.isActive = false
+    try {
+      await this.stop()
+      if (this.onFallback) await this.onFallback()
+    } finally {
+      this.aborting = false
+    }
+  }
+
+  /** Set when a retry cannot help, so AudioManager can explain the real cause. */
+  getPermanentFailure(): { title: string; body: string } | null {
+    return this.permanentFailure
+      ? { title: this.permanentFailure.title, body: this.permanentFailure.body }
+      : null
   }
 
   private async handleDisconnect(source: AudioSource): Promise<void> {
@@ -201,9 +249,9 @@ export class AssemblyAITranscriptionService {
       return
     }
 
-    const tokenResult = await fetchTranscriptionToken()
-    if (!tokenResult) {
-      log.error('Cannot get token for reconnect - triggering fallback')
+    const apiKey = getApiKey('assemblyaiApiKey')
+    if (!apiKey) {
+      log.error('AssemblyAI key disappeared before reconnect - triggering fallback')
       state.reconnecting = false
       if (this.onFallback) {
         await this.stop()
@@ -212,43 +260,27 @@ export class AssemblyAITranscriptionService {
       return
     }
 
-    const result = await this.startTranscriber(source, tokenResult.token)
+    const result = await this.startTranscriber(source, apiKey)
     state.reconnecting = false
     if (result.success) {
       log.info(`[${source.toUpperCase()}] Reconnected successfully`)
     }
   }
 
-  private scheduleTokenRefresh(expiresInSeconds: number): void {
-    if (this.tokenRefreshTimer) clearTimeout(this.tokenRefreshTimer)
-
-    const refreshIn = Math.max(0, (expiresInSeconds * 1000) - TOKEN_REFRESH_BUFFER_MS)
-    this.tokenRefreshTimer = setTimeout(async () => {
-      if (!this.isActive) return
-      log.info('Refreshing AssemblyAI transcription session (token expiring)...')
-
-      // Close existing connections and reconnect with new tokens
-      await this.closeTranscriber(this.micState)
-      await this.closeTranscriber(this.systemState)
-
-      const tokenResult = await fetchTranscriptionToken()
-      if (!tokenResult) {
-        log.error('Token refresh failed - triggering fallback')
-        if (this.onFallback) {
-          this.isActive = false
-          await this.onFallback()
-        }
-        return
-      }
-
-      this.tokenExpiresAt = Date.now() + (tokenResult.expiresIn * 1000)
-      this.scheduleTokenRefresh(tokenResult.expiresIn)
-
-      await Promise.all([
-        this.startTranscriber('mic', tokenResult.token),
-        this.startTranscriber('system', tokenResult.token),
-      ])
-    }, refreshIn)
+  /**
+   * Emit whatever unformatted turn is still held.
+   *
+   * resolveTurnAction only flushes a held turn when a LATER turn proves the
+   * earlier one is over, which never happens if the stream ends first. Called
+   * on close and on stop.
+   */
+  private flushPending(source: AudioSource): void {
+    const state = source === 'mic' ? this.micState : this.systemState
+    const texts = flushPendingTurn(state.pendingTurn)
+    state.pendingTurn = null
+    for (const text of texts) {
+      this.handleFinalTranscript(text, source)
+    }
   }
 
   sendAudio(buffer: Buffer | ArrayBuffer, source: AudioSource): void {
@@ -273,10 +305,10 @@ export class AssemblyAITranscriptionService {
 
   async stop(): Promise<void> {
     this.isActive = false
-    if (this.tokenRefreshTimer) {
-      clearTimeout(this.tokenRefreshTimer)
-      this.tokenRefreshTimer = null
-    }
+    // Before closing: a held turn is real speech the user said or heard, and
+    // stopping is the most likely moment for one to be outstanding.
+    this.flushPending('mic')
+    this.flushPending('system')
     await Promise.all([
       this.closeTranscriber(this.micState),
       this.closeTranscriber(this.systemState),
@@ -297,6 +329,7 @@ export class AssemblyAITranscriptionService {
     }
     state.isConnected = false
     state.currentInterim = ''
+    state.pendingTurn = null
   }
 
   private handleFinalTranscript(text: string, source: AudioSource): void {
