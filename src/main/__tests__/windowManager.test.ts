@@ -835,4 +835,52 @@ describe('windowManager', () => {
       expect(mockBrowserWindowInstance.webContents.send).toHaveBeenCalledWith('overlay:shown')
     })
   })
+
+  describe('persisted stealth preference at window creation', () => {
+    // Regression: the only boot-time setStealthMode(true) sat behind
+    // `shouldShowOverlayNow` in index.ts, which ANDs in app.isPackaged. A user
+    // who turned undetectability ON in a previous session therefore relaunched
+    // CAPTURABLE on every dev run and on any packaged run whose first overlay
+    // show was deferred - while the pill still drew the blue "Undetectable" eye,
+    // because the renderer reads the stored flag on its own. UI asserted
+    // protection the window did not have.
+    const stealth = (value: unknown) =>
+      mockGetSetting.mockImplementation(((key: unknown) =>
+        key === 'stealthEnabled' ? value : null) as () => null)
+
+    it('protects the overlay at creation when the stored preference is ON', () => {
+      stealth(true)
+      createOverlayWindow('/preload.js', null)
+      expect(mockBrowserWindowInstance.setContentProtection).toHaveBeenCalledWith(true)
+    })
+
+    it('protects the dashboard at creation when the stored preference is ON', () => {
+      stealth(true)
+      createDashboardWindow('/preload.js', null)
+      expect(mockBrowserWindowInstance.setContentProtection).toHaveBeenCalledWith(true)
+    })
+
+    it('leaves the overlay unprotected when the stored preference is OFF', () => {
+      stealth(false)
+      createOverlayWindow('/preload.js', null)
+      expect(mockBrowserWindowInstance.setContentProtection).toHaveBeenCalledWith(false)
+      expect(mockBrowserWindowInstance.setContentProtection).not.toHaveBeenCalledWith(true)
+    })
+
+    it('leaves the dashboard unprotected when the stored preference is OFF', () => {
+      stealth(false)
+      createDashboardWindow('/preload.js', null)
+      expect(mockBrowserWindowInstance.setContentProtection).not.toHaveBeenCalledWith(true)
+    })
+
+    it('does not depend on the window ever being shown', () => {
+      // The old path only ran inside the boot show branch. Creation alone must
+      // be enough - nothing here calls show().
+      stealth(true)
+      createOverlayWindow('/preload.js', null)
+      expect(mockBrowserWindowInstance.show).not.toHaveBeenCalled()
+      expect(mockBrowserWindowInstance.setContentProtection).toHaveBeenCalledWith(true)
+    })
+  })
+
 })

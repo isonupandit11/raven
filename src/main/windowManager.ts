@@ -4,6 +4,7 @@ import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { getSetting, saveSetting } from './store'
 import { applyOverlayToolWindowStyle } from './windowsOverlayStyle'
+import { clampOverlayOpacity } from '../shared/overlayOpacity'
 import { DASHBOARD_DEFAULT_WIDTH, DASHBOARD_DEFAULT_HEIGHT, DASHBOARD_MIN_WIDTH, DASHBOARD_MIN_HEIGHT } from './constants'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -183,6 +184,12 @@ export function createDashboardWindow(preloadPath: string, rendererURL: string |
     minWidth: DASHBOARD_MIN_WIDTH,
     minHeight: DASHBOARD_MIN_HEIGHT,
     show: false,
+    // Overlay-first UX: the dashboard is a tool window, not an app window.
+    // Without this it sat in the taskbar even while the overlay was hidden,
+    // which defeats the point on a shared screen. The Alt-Tab entry is
+    // removed separately via applyOverlayToolWindowStyle() below, because
+    // skipTaskbar alone does not touch the Alt-Tab switcher on Windows.
+    skipTaskbar: true,
     title: 'Raven',
     backgroundColor: '#ffffff',
     ...(process.platform === 'darwin'
@@ -205,6 +212,15 @@ export function createDashboardWindow(preloadPath: string, rendererURL: string |
 
   applyCSP(dashboardWindow)
   disableZoom(dashboardWindow)
+
+  // Remove the dashboard from the Alt-Tab switcher too. skipTaskbar above only
+  // drops the taskbar button; WS_EX_TOOLWINDOW drops both. Best-effort and a
+  // silent no-op off Windows or if the native module is missing.
+  applyOverlayToolWindowStyle(dashboardWindow)
+
+  // Same persisted-stealth fix as the overlay: setStealthMode() covers both
+  // windows, so a stored preference has to reach both at creation too.
+  dashboardWindow.setContentProtection(getSetting('stealthEnabled'))
 
   const loadDashboard = (): void => {
     if (!dashboardWindow || dashboardWindow.isDestroyed()) return
@@ -231,9 +247,9 @@ export function createDashboardWindow(preloadPath: string, rendererURL: string |
           document.head.appendChild(s);
           var c = document.createElement('div');
           c.className = 'win-controls';
-          c.innerHTML = '<button onclick="window.raven?.windowMinimize?.()" title="Minimize"><svg viewBox="0 0 10 1"><rect fill="currentColor" width="10" height="1"/></svg></button>'
-            + '<button onclick="window.raven?.windowMaximize?.()" title="Maximize"><svg viewBox="0 0 10 10"><rect fill="none" stroke="currentColor" stroke-width="1" x="0.5" y="0.5" width="9" height="9"/></svg></button>'
-            + '<button class="close" onclick="window.raven?.windowClose?.()" title="Close"><svg viewBox="0 0 10 10"><line stroke="currentColor" stroke-width="1.2" x1="0" y1="0" x2="10" y2="10"/><line stroke="currentColor" stroke-width="1.2" x1="10" y1="0" x2="0" y2="10"/></svg></button>';
+          c.innerHTML = '<button onclick="window.raven?.windowMinimize?.()" aria-label="Minimize"><svg viewBox="0 0 10 1"><rect fill="currentColor" width="10" height="1"/></svg></button>'
+            + '<button onclick="window.raven?.windowMaximize?.()" aria-label="Maximize"><svg viewBox="0 0 10 10"><rect fill="none" stroke="currentColor" stroke-width="1" x="0.5" y="0.5" width="9" height="9"/></svg></button>'
+            + '<button class="close" onclick="window.raven?.windowClose?.()" aria-label="Close"><svg viewBox="0 0 10 10"><line stroke="currentColor" stroke-width="1.2" x1="0" y1="0" x2="10" y2="10"/><line stroke="currentColor" stroke-width="1.2" x1="10" y1="0" x2="0" y2="10"/></svg></button>';
           document.body.appendChild(c);
         })()
       `)
@@ -261,7 +277,16 @@ export function createDashboardWindow(preloadPath: string, rendererURL: string |
   })
 
   dashboardWindow.on('ready-to-show', () => {
-    dashboardWindow?.show()
+    // Overlay-first UX: don't raise a visible window on launch. The tray and
+    // the overlay are the entry points; the dashboard opens only when asked
+    // for (tray menu, or the overlay's Dashboard button).
+    //
+    // First run is the exception — onboarding lives in the dashboard, so an
+    // unconfigured install must still surface it or the app looks dead.
+    const isFirstRun = !getSetting('onboardingComplete')
+    if (isFirstRun || getSetting('showDashboardOnLaunch')) {
+      dashboardWindow?.show()
+    }
     // Electron may switch to Accessory activation policy during the gap between
     // window creation (show:false) and ready-to-show, especially when a panel-type
     // overlay window exists. In stealth mode the dock icon must stay hidden, so
@@ -370,8 +395,29 @@ export function createOverlayWindow(preloadPath: string, rendererURL: string | n
   reloadOverlay = loadOverlay
   attachRendererDiagnostics(overlayWindow, 'overlay', loadOverlay)
 
+  // User-set opacity. clampOverlayOpacity caps darwin at 0.99, which preserves
+  // the sub-1 value this platform has always needed to stay on the compositing
+  // path that always-on-top + visible-on-all-workspaces depends on - so the
+  // slider cannot accidentally undo it by reaching a true 1.
+  overlayWindow.setOpacity(clampOverlayOpacity(getSetting('overlayOpacity')))
+
+  // Apply the PERSISTED stealth preference at creation time.
+  //
+  // Previously the only boot-time call to setStealthMode(true) lived behind
+  // `shouldShowOverlayNow` in index.ts, which ANDs in `app.isPackaged`. So on
+  // every unpackaged run - and on any packaged run that deferred the first
+  // overlay show (permissions not yet granted) - a user who had switched
+  // undetectability ON in a previous session came back up CAPTURABLE, with the
+  // pill still rendering the blue "Undetectable" eye because the renderer reads
+  // the same stored flag independently. The UI claimed protection the window
+  // did not have, which is the worst possible direction for this failure.
+  //
+  // setContentProtection is the whole of what stealth means for capture; the
+  // rest of setStealthMode (renderer notify, macOS dock) is not needed here
+  // because the renderer pulls the flag itself on mount.
+  overlayWindow.setContentProtection(getSetting('stealthEnabled'))
+
   if (process.platform === 'darwin') {
-    overlayWindow.setOpacity(0.99)
     overlayWindow.setAlwaysOnTop(true, 'screen-saver', 1)
     overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
   } else {

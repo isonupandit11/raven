@@ -42,11 +42,58 @@ export interface LocalSettings {
 
   // Preferences
   stealthEnabled: boolean;
+  /**
+   * Overlay-first UX. When false (default) the dashboard never opens by
+   * itself: launch goes straight to the overlay + tray, and the dashboard
+   * is only shown when the user asks for it (tray, or the overlay's
+   * Dashboard button). First run still shows it so onboarding is reachable.
+   */
+  showDashboardOnLaunch: boolean;
+  /**
+   * When false (default) ending a session does not raise the dashboard.
+   * The old behavior popped a window and stole focus on every stop —
+   * including transcription failures mid-call. See audioManager.
+   */
+  showDashboardOnSessionEnd: boolean;
+  /**
+   * Cursor behaviour over the overlay. Content protection hides the overlay's
+   * pixels from a capture but NOT the mouse cursor, which the capturer draws
+   * itself - so a pointer turning into a hand over an invisible button is a
+   * visible tell. 'neutral' (default) pins a plain arrow; 'hidden' removes the
+   * cursor entirely while over the overlay; 'off' restores normal affordances.
+   */
+  /**
+   * Overlay window opacity, 0.3..1 (0.3..0.99 on macOS). Clamped by
+   * clampOverlayOpacity in src/shared/overlayOpacity.ts, which floors it so the
+   * overlay can never become invisible-but-clickable.
+   */
+  overlayOpacity: number;
   theme: 'light' | 'dark' | 'system';
   openOnLogin: boolean;
   transcriptionLanguage: string;
   /** Which STT engine to try. `auto` follows language routing. */
   sttProvider: 'auto' | 'assemblyai' | 'deepgram';
+  /**
+   * Capture the system/loopback audio stream (i.e. the other party on a call).
+   *
+   * Was read by systemAudioNative.ts and written by the dashboard's Audio tab
+   * while being declared NOWHERE - not in this interface, not in
+   * STORE_DEFAULTS, not in getAllSettings. It happened to behave because
+   * store.get() returned undefined and the read sites test `!== false`, so the
+   * default was "on" purely by accident. Declared so it has a real default and
+   * appears in getAllSettings like every other setting.
+   */
+  captureSystemAudio: boolean;
+  /**
+   * Answer questions from the other party without being asked to.
+   *
+   * On by default: needing to press a button every time someone asks you
+   * something defeats the point during a live call. The policy that decides
+   * when to fire is in renderer/lib/autoAnswer.ts - it only ever reacts to the
+   * SYSTEM stream, never the microphone, so it cannot answer the user's own
+   * speech back to them.
+   */
+  autoAnswer: boolean;
   outputLanguage: string;
   // User's custom vocabulary for transcription (comma-separated string
   // stored locally, parsed into string[] when passed to the backend as
@@ -59,6 +106,17 @@ export interface LocalSettings {
   aiProvider: 'anthropic' | 'openai';
   aiModel: string;
   aiEffort: string;
+  /**
+   * Optional OpenAI-compatible base URL for the 'openai' provider. Empty =
+   * api.openai.com. Set it to reach Gemini, Groq, OpenRouter, DeepSeek or a
+   * local Ollama with the existing provider:
+   *   https://generativelanguage.googleapis.com/v1beta/openai
+   *   https://api.groq.com/openai/v1
+   *   http://127.0.0.1:11434/v1
+   * When set, aiModel is passed through verbatim (the OpenAI model catalog
+   * does not apply) and reasoning-effort params are suppressed.
+   */
+  aiBaseUrl: string;
   /**
    * Notes slot (title, summary, insights). Empty = follow assist provider's
    * cheap default (Haiku / Luna). See src/shared/aiSlots.ts.
@@ -104,16 +162,30 @@ const STORE_DEFAULTS: LocalSettings = {
   proOnboardingStep: '',
   dashboardBounds: null,
   overlayBounds: null,
-  stealthEnabled: false,
+  // Default ON. This fork exists to answer questions during a call without the
+  // other party seeing it, and stealthEnabled is the single flag that decides
+  // whether the windows are excluded from screen capture. Shipping it off meant
+  // a fresh install was fully capturable during exactly the scenario it is for,
+  // and nothing in onboarding turned it on - only a manual click on the eye in
+  // the controller pill ever wrote this key. The eye is still a one-click
+  // reversal for anyone who wants to demo or record the app itself.
+  stealthEnabled: true,
+  showDashboardOnLaunch: false,
+  showDashboardOnSessionEnd: false,
+  overlayOpacity: 1,
   theme: 'system',
   openOnLogin: false,
   transcriptionLanguage: 'en',
   sttProvider: 'auto',
+  // On: hearing the other side of the call is the entire point of the app.
+  captureSystemAudio: true,
+  autoAnswer: true,
   outputLanguage: 'en',
   vocabulary: '',
   aiProvider: 'anthropic',
   aiModel: 'claude-haiku-4-5',
   aiEffort: 'low',
+  aiBaseUrl: '',
   notesProvider: '',
   notesModel: '',
   notesEffort: '',
@@ -190,15 +262,21 @@ export function getAllSettings(): LocalSettings {
     dashboardBounds: store.get('dashboardBounds'),
     overlayBounds: store.get('overlayBounds'),
     stealthEnabled: store.get('stealthEnabled'),
+    showDashboardOnLaunch: store.get('showDashboardOnLaunch'),
+    showDashboardOnSessionEnd: store.get('showDashboardOnSessionEnd'),
+    overlayOpacity: store.get('overlayOpacity'),
     theme: store.get('theme'),
     openOnLogin: store.get('openOnLogin'),
     transcriptionLanguage: store.get('transcriptionLanguage'),
     sttProvider: store.get('sttProvider'),
+    captureSystemAudio: store.get('captureSystemAudio'),
+    autoAnswer: store.get('autoAnswer'),
     outputLanguage: store.get('outputLanguage'),
     vocabulary: store.get('vocabulary'),
     aiProvider: store.get('aiProvider'),
     aiModel: store.get('aiModel'),
     aiEffort: store.get('aiEffort'),
+    aiBaseUrl: store.get('aiBaseUrl'),
     notesProvider: store.get('notesProvider'),
     notesModel: store.get('notesModel'),
     notesEffort: store.get('notesEffort'),
@@ -296,6 +374,28 @@ export function saveApiKeys(
     store.set('recallApiKey', encryptValue(extras.recallApiKey));
   }
   store.set('apiKeysConfigured', true);
+}
+
+/**
+ * Set ONE AI provider key, leaving every other key untouched.
+ *
+ * saveApiKeys() overwrites deepgramApiKey and anthropicApiKey
+ * unconditionally, and the renderer cannot read keys back to pass them
+ * through (getAllSettings blanks all secrets by design). So a caller that
+ * only wants to set the OpenAI key - e.g. the overlay's AI settings panel
+ * pointing at Gemini - had no safe way to do it: it would have wiped the
+ * user's Deepgram key as a side effect. This is that safe path.
+ */
+export function saveAiProviderKey(provider: 'anthropic' | 'openai', key: string): void {
+  const field = provider === 'openai' ? 'openaiApiKey' : 'anthropicApiKey';
+  store.set(field, encryptValue(key));
+  // Only flip the boot flag when the app genuinely has what it needs (an STT
+  // key AND the active provider's AI key). hasApiKeys() is the real test;
+  // setting it here unconditionally would let onboarding be skipped with no
+  // transcription key configured.
+  if (hasApiKeys()) {
+    store.set('apiKeysConfigured', true);
+  }
 }
 
 export function hasApiKeys(): boolean {

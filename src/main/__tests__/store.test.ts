@@ -36,6 +36,7 @@ import {
   saveSetting,
   getAllSettings,
   saveApiKeys,
+  saveAiProviderKey,
   saveSettings,
   hasApiKeys,
   clearApiKeys,
@@ -50,6 +51,57 @@ describe('store', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockIsEncryptionAvailable.mockReturnValue(false)
+  })
+
+  describe('saveAiProviderKey', () => {
+    it('writes only the openai key, leaving deepgram and anthropic untouched', () => {
+      mockGet.mockReturnValue('')
+
+      saveAiProviderKey('openai', 'sk-openai')
+
+      const written = mockSet.mock.calls.map((c) => c[0])
+      expect(written).toContain('openaiApiKey')
+      // The whole point: saveApiKeys() clobbers these two unconditionally, and
+      // the renderer cannot read them back to pass them through, so a partial
+      // update through that path would destroy the user's STT key.
+      expect(written).not.toContain('deepgramApiKey')
+      expect(written).not.toContain('anthropicApiKey')
+      expect(written).not.toContain('assemblyaiApiKey')
+    })
+
+    it('writes only the anthropic key for the anthropic provider', () => {
+      mockGet.mockReturnValue('')
+
+      saveAiProviderKey('anthropic', 'sk-ant')
+
+      const written = mockSet.mock.calls.map((c) => c[0])
+      expect(written).toContain('anthropicApiKey')
+      expect(written).not.toContain('openaiApiKey')
+      expect(written).not.toContain('deepgramApiKey')
+    })
+
+    it('does not mark keys configured while no STT key exists', () => {
+      // No transcription key -> hasApiKeys() is false -> onboarding must not be
+      // skippable just because an AI key was set.
+      mockGet.mockImplementation((key: string) => (key === 'aiProvider' ? 'openai' : ''))
+
+      saveAiProviderKey('openai', 'sk-openai')
+
+      expect(mockSet.mock.calls.map((c) => c[0])).not.toContain('apiKeysConfigured')
+    })
+
+    it('marks keys configured once both an STT key and the active AI key exist', () => {
+      mockGet.mockImplementation((key: string) => {
+        if (key === 'aiProvider') return 'openai'
+        if (key === 'deepgramApiKey') return 'dg'
+        if (key === 'openaiApiKey') return 'sk-openai'
+        return ''
+      })
+
+      saveAiProviderKey('openai', 'sk-openai')
+
+      expect(mockSet).toHaveBeenCalledWith('apiKeysConfigured', true)
+    })
   })
 
   describe('getStore', () => {
