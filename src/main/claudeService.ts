@@ -2,6 +2,8 @@ import { BrowserWindow, ipcMain, desktopCapturer, screen } from 'electron';
 import { v4 as uuidv4 } from 'uuid';
 import { sessionManager } from './services/sessionManager';
 import { getProviderFromStore } from './services/ai/providerFactory';
+import { blockedActionReason } from './services/ai/actionContext';
+import { stripPromptScaffolding } from '../shared/promptScaffolding';
 import { getSetting } from './store';
 import type { AIMessage } from './services/ai/types';
 import { contextWindowFor, fitMessagesToContext, resolveCatalogModel, streamMaxTokensFor } from './services/ai/types';
@@ -59,8 +61,11 @@ interface ScreenshotAttachment {
   previewData: string;
 }
 
-let getServerSystemPrompt: (() => Promise<string | null>) | null = null
-let getServerActionPrompt: ((action: string) => Promise<string | null>) | null = null
+// Always null in the open build: these were the hooks a hosted backend used to
+// override the local prompts. Nothing assigns them any more, so they are const
+// (the call sites still null-check, which keeps the seam if a backend returns).
+const getServerSystemPrompt: (() => Promise<string | null>) | null = null
+const getServerActionPrompt: ((action: string) => Promise<string | null>) | null = null
 
 const buildSystemPrompt = (modePrompt?: string, ragChunks?: Array<{ chunkText: string; fileName: string; score: number }>): string => {
   // Keep this mirror of the server-side system prompt (backend/src/seed.ts)
@@ -397,11 +402,37 @@ export class ClaudeService {
 
         this.isProcessing = true;
 
-        const provider = await getProviderFromStore();
-
         const screenshotAttachment = params.includeScreenshot
           ? await this.captureScreenshotExcludingRaven()
           : null;
+
+        // Refuse actions whose prompt is about context we do not have, BEFORE
+        // any provider call. buildTranscriptBlock omits <transcript> entirely
+        // when the transcript is empty, but ACTION_PROMPTS still instruct the
+        // model to work "based on <transcript>" - and given an instruction
+        // about a section that is not there, the model writes the section. That
+        // produced a confident answer to a question nobody asked, on a machine
+        // with transcription switched off. Guarding here rather than in the
+        // prompt is the point: asking the model to admit it has no transcript
+        // is a request; not calling it is a guarantee.
+        const blockedReason = blockedActionReason({
+          action: params.action,
+          transcript: params.transcript,
+          customPrompt: params.customPrompt,
+          hasScreenshot: Boolean(screenshotAttachment),
+        });
+        if (blockedReason) {
+          log.info(`Blocked '${params.action}': no usable context`);
+          // MUST clear isProcessing before returning. This handler has no
+          // finally block - it resets the flag on the success path and in the
+          // catch - so an early return would leave it true forever and every
+          // later request would be dropped by the guard at the top.
+          this.isProcessing = false;
+          this.broadcastError(blockedReason);
+          return { blocked: true as const, reason: blockedReason };
+        }
+
+        const provider = await getProviderFromStore();
 
         this.conversation.memory = pinOpeningIfNeeded(this.conversation.memory, params.transcript);
         if (params.action === 'custom' && params.customPrompt) {
@@ -513,11 +544,16 @@ export class ClaudeService {
             {
               onText: (text) => {
                 fullResponse += text;
+                // Clean what the UI shows, not the accumulator - stripping the
+                // running buffer would corrupt it the moment a tag straddled
+                // two chunks. streaming:true also drops a half-arrived tag
+                // ("<transcr") that would otherwise type itself out on screen
+                // and then vanish.
                 this.broadcast({
                   type: 'delta',
                   messageId: assistantMessageId,
                   text,
-                  fullText: fullResponse,
+                  fullText: stripPromptScaffolding(fullResponse, { streaming: true }),
                 });
               },
               onDone: () => {
@@ -559,10 +595,17 @@ export class ClaudeService {
           return;
         }
 
+        // Strip once, here, and let every consumer share the result: the
+        // bubble, the copy button, conversation history, session storage, and
+        // the notes/summary prompts that read these responses back. Doing it at
+        // render time instead would have left the tags in the clipboard and in
+        // everything downstream.
+        const cleanResponse = stripPromptScaffolding(fullResponse);
+
         const assistantMessage: ChatMessage = {
           id: assistantMessageId,
           role: 'assistant',
-          content: fullResponse,
+          content: cleanResponse,
           timestamp: Date.now(),
         };
         this.conversation.messages.push(assistantMessage);
@@ -583,14 +626,14 @@ export class ClaudeService {
           id: uuidv4(),
           action: params.action,
           userMessage: userMessageText,
-          response: fullResponse,
+          response: cleanResponse,
           timestamp: Date.now(),
         });
 
         this.broadcast({
           type: 'done',
           messageId: assistantMessageId,
-          fullText: fullResponse,
+          fullText: cleanResponse,
           assistantMessage,
         });
 
