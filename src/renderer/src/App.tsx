@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { createLogger } from './lib/logger'
+import { applyCursorPrivacy } from './lib/cursorPrivacy'
 import { Onboarding } from './components/Onboarding'
 import { Dashboard } from './components/dashboard/Dashboard'
 import { OverlayWindow } from './components/overlay/OverlayWindow'
@@ -53,6 +54,19 @@ function App(): JSX.Element {
     }
     void init()
   }, [])
+
+  // Cursor privacy is overlay-only: content protection hides the overlay's
+  // pixels but not the mouse cursor, so a pointer turning into a hand over an
+  // invisible button gives the overlay away. The dashboard keeps normal
+  // affordances. See lib/cursorPrivacy.ts.
+  useEffect(() => {
+    if (windowType !== 'overlay') return
+
+    // No stored value to read any more: the only sensible mode is the private
+    // one, so it is applied unconditionally. That also removes the window where
+    // a slow storeGet left normal cursors active on a freshly shown overlay.
+    applyCursorPrivacy(document.documentElement)
+  }, [windowType])
 
   useEffect(() => {
     if (windowType !== 'dashboard') return

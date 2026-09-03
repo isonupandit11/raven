@@ -102,17 +102,35 @@ export function ControllerPill({
       onMouseDown={() => setTooltip(null)}
     >
       {/* Logo */}
+      {/* The logo is the drag handle (and click-to-toggle), which was
+          undiscoverable: it carried cursor-default, so nothing indicated it
+          could be grabbed.
+
+          Two affordances, deliberately split by what leaks:
+          - A VISUAL hover state (background + slight scale). Free for stealth,
+            because content protection removes the overlay's pixels from a
+            capture - a viewer never sees it.
+          - cursor: grab, which does NOT leak-proof, because the cursor is drawn
+            by the capturer. So it is left to be overridden: cursorPrivacy
+            'neutral'/'hidden' pins it back to a plain arrow via the
+            !important rules in index.css, and only privacy 'off' shows grab.
+
+          No `title` here on purpose: a native tooltip is a separate OS-level
+          window and would not be content-protected, so it would appear in a
+          screen share even though the overlay does not. The pill has its own
+          in-window tooltip system for that reason. */}
       <button
         onClick={onLogoClick}
         onMouseDown={onLogoMouseDown}
         onMouseEnter={() => setTooltip(null)}
-        className="w-8 h-8 flex items-center justify-center cursor-default"
+        aria-label="Move overlay (drag) or toggle panel (click)"
+        className="group w-8 h-8 flex items-center justify-center rounded-lg cursor-grab active:cursor-grabbing hover:bg-white/10 transition-colors"
         style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
       >
         <img
           src={ravenLogo}
           alt="Raven"
-          className="w-8 h-8 object-contain opacity-100"
+          className="w-8 h-8 object-contain opacity-100 transition-transform duration-150 group-hover:scale-110 group-active:scale-95"
           draggable={false}
         />
       </button>

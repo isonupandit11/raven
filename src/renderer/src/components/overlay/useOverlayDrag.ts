@@ -17,12 +17,23 @@ export function useOverlayDrag(options: UseOverlayDragOptions) {
   const logoDragMovedRef = useRef(false)
   const logoDragCleanupRef = useRef<(() => void) | null>(null)
 
+  /**
+   * The logo is the MOVE HANDLE, and nothing else.
+   *
+   * It used to raise the full dashboard window on any click that did not
+   * cross the drag threshold. That made the single largest, most inviting
+   * target in the pill - the one with grab affordances and a hover state -
+   * a one-click way to throw an ordinary application window over the top of
+   * a live meeting. A nudge too small to register as a drag counted as a
+   * click, so it also fired on a failed reposition attempt.
+   *
+   * The dashboard is now reachable from one deliberate, labelled place:
+   * "Open dashboard" inside the settings popover. Here we only swallow the
+   * synthetic click that follows a real drag, so the logo behaves exactly
+   * the way its grab cursor advertises.
+   */
   const handleLogoClick = useCallback(() => {
-    if (logoDragMovedRef.current) {
-      logoDragMovedRef.current = false
-      return
-    }
-    window.raven.windowShowDashboard?.()
+    logoDragMovedRef.current = false
   }, [])
 
   const handleLogoMouseDown = useCallback((event: ReactMouseEvent<HTMLButtonElement>) => {

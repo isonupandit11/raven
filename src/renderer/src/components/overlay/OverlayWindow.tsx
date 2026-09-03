@@ -14,6 +14,11 @@ import 'highlight.js/styles/github-dark-dimmed.css'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Sparkles, Wand2, MessageSquareText, RotateCcw, ChevronRight } from 'lucide-react'
 import { ControllerPill } from './ControllerPill'
+import { ModePicker } from './ModePicker'
+import { AiSettingsPopover } from './AiSettingsPopover'
+import { OverlaySizePicker } from './OverlaySizePicker'
+import { shouldAutoAnswer } from '../../lib/autoAnswer'
+import { OVERLAY_SIZES, type OverlayDimensions } from '../../lib/overlaySizes'
 import { TranscriptTab } from './TranscriptTab'
 import { OverlayNotification, type NotificationData } from './OverlayNotification'
 import { useOverlayResize } from './useOverlayResize'
@@ -64,7 +69,7 @@ function CodeBlock({ children }: { children: React.ReactNode }) {
         type="button"
         onClick={() => { void handleCopy() }}
         className="absolute top-2 right-2 w-7 h-7 rounded-md flex items-center justify-center bg-white/10 hover:bg-white/20 text-white/50 hover:text-white transition-all opacity-0 group-hover/code:opacity-100"
-        title={copied ? 'Copied!' : 'Copy code'}
+        aria-label={copied ? 'Copied!' : 'Copy code'}
       >
         {copied ? (
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
@@ -105,7 +110,7 @@ export function OverlayWindow() {
   const resize = useOverlayResize(safeInsets)
   const {
     panelWidth, panelRight, panelBottom, panelHeight,
-    setPanelRight, setPanelBottom, setPanelHeight,
+    setPanelWidth, setPanelRight, setPanelBottom, setPanelHeight,
     hoveredResizeEdge, setHoveredResizeEdge,
     activeResizeEdge,
     handleResizeStart,
@@ -142,8 +147,6 @@ export function OverlayWindow() {
   const [isStarting, setIsStarting] = useState(false)
   const [stealthEnabled, setStealthEnabled] = useState(false)
   const [incognitoMode, setIncognitoMode] = useState(false)
-  const [isHoveringPanel, setIsHoveringPanel] = useState(false)
-  const [isHoveringX, setIsHoveringX] = useState(false)
   const [inputValue, setInputValue] = useState('')
   const [responses, setResponses] = useState<ResponseCard[]>([])
   const [isLoadingResponse, setIsLoadingResponse] = useState(false)
@@ -160,9 +163,15 @@ export function OverlayWindow() {
 
   // Refs
   const inputRef = useRef<HTMLInputElement>(null)
-  const hideXTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const activeResponseIdRef = useRef<string | null>(null)
   const requestInFlightRef = useRef(false)
+  const lastAutoAnswerAtRef = useRef<number | null>(null)
+  /**
+   * Read through a ref, not state, so the transcript subscription mounts once.
+   * Resubscribing whenever the toggle changes would drop transcript events
+   * during the swap - and a missed final is a missed question.
+   */
+  const autoAnswerRef = useRef(true)
   const aiStartWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const responseAreaRef = useRef<HTMLDivElement | null>(null)
   const copiedResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -178,17 +187,16 @@ export function OverlayWindow() {
     setPanelRight, setPanelBottom, setOverlayMouseIgnore,
   })
 
-  const clearHideXTimer = () => {
-    if (hideXTimerRef.current) {
-      clearTimeout(hideXTimerRef.current)
-      hideXTimerRef.current = null
-    }
-  }
-
   // Initialize
   useEffect(() => {
     window.raven.storeGet('stealthEnabled').then((enabled) => {
       if (typeof enabled === 'boolean') setStealthEnabled(enabled)
+    }).catch(() => {})
+
+    // Ref, not state: the transcript subscription must not resubscribe when this
+    // changes, and nothing renders from it.
+    window.raven.storeGet('autoAnswer').then((enabled) => {
+      if (typeof enabled === 'boolean') autoAnswerRef.current = enabled
     }).catch(() => {})
 
     window.raven.storeGet('incognitoMode').then((enabled) => {
@@ -335,7 +343,6 @@ export function OverlayWindow() {
       unsubClaude()
       unsubAi()
       unsubSessionLimit()
-      clearHideXTimer()
       cleanupResize()
       if (copiedResetTimerRef.current) {
         clearTimeout(copiedResetTimerRef.current)
@@ -577,6 +584,37 @@ export function OverlayWindow() {
     }
   }, [])
 
+  // Tell the user when the OS refused one of our global shortcuts. Registration
+  // is first-come-first-served machine-wide, so another overlay tool holding
+  // Ctrl+\ is enough - and previously that was only written to the log, leaving
+  // the user pressing a dead key with nothing to explain it. Pulled rather than
+  // pushed because registration happens before this renderer exists.
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const unavailable = await window.raven.shortcutsGetUnavailable()
+        if (cancelled || unavailable.length === 0) return
+        pushNotification({
+          id: `shortcuts-unavailable-${Date.now()}`,
+          title: 'Some shortcuts are taken',
+          body: `${unavailable.join(', ')} ${unavailable.length === 1 ? 'is' : 'are'} already in use by another app, so ${unavailable.length === 1 ? 'it' : 'they'} will not work. Quit that app and restart Raven, or use the tray icon.`,
+          type: 'warning',
+          // Must self-dismiss like every other overlay toast. Without this it
+          // was the only sticky one, so a launch-time warning parked itself in
+          // the corner for the whole meeting - and if stealth is off, that is a
+          // persistent visible artifact on a shared screen.
+          autoDismissMs: 12000,
+        })
+      } catch (err) {
+        log.error('Failed to read unavailable shortcuts:', err)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [pushNotification])
+
   // Meeting auto-start: main detects a Zoom/Meet/Teams/Webex window and pushes
   // this event. In 'auto' mode it also asks us to start immediately; in
   // 'prompt' mode we show a toast with a Start button. The action's onClick is
@@ -712,6 +750,41 @@ export function OverlayWindow() {
     await beginAiRequest({ action, includeScreenshot: false })
   }
 
+  /**
+   * Answer a question from the other party without being asked.
+   *
+   * Routed through beginAiRequest, the same path the "What should I say?" chip
+   * uses, so an automatic answer is identical to a manual one - same in-flight
+   * guard, same watchdog, same context guard in main. Only the trigger differs.
+   *
+   * The decision is a pure function in lib/autoAnswer.ts so the rules are
+   * inspectable and tested rather than emergent. It reacts to the SYSTEM stream
+   * only; a microphone entry can never fire one, which is what stops Raven
+   * answering the user's own speech back to them as they talk.
+   */
+  useEffect(() => {
+    return window.raven.onTranscriptUpdate((data) => {
+      const entry = data.entry
+      if (!entry) return
+      const decision = shouldAutoAnswer({
+        speaker: entry.speaker,
+        text: entry.text,
+        isFinal: entry.isFinal,
+        enabled: autoAnswerRef.current,
+        busy: requestInFlightRef.current,
+        now: Date.now(),
+        lastFiredAt: lastAutoAnswerAtRef.current,
+      })
+      if (!decision.fire) return
+      // Stamped BEFORE the request, not when it resolves. Arming the cooldown
+      // on completion would let a question that lands mid-request fire the
+      // instant the first finishes, turning a burst into a queue.
+      lastAutoAnswerAtRef.current = Date.now()
+      log.info(`Auto-answer: ${decision.reason}`)
+      void beginAiRequest({ action: 'what-should-i-say', includeScreenshot: false })
+    })
+  }, [beginAiRequest])
+
   const handleSend = async () => {
     if (requestInFlightRef.current) return
 
@@ -725,22 +798,58 @@ export function OverlayWindow() {
     })
   }
 
-  const handleClear = () => {
-    setOverlayMouseIgnore(true)
-    window.raven.windowHide()
-  }
+  // Ctrl+Shift+1..4. Same applyPanelSize path as the buttons, so a shortcut and
+  // a click cannot diverge; registered after it is defined.
+  useEffect(() => {
+    return window.raven.onHotkeySetOverlaySize((size) => {
+      const preset = OVERLAY_SIZES[size]
+      if (preset) applyPanelSizeRef.current?.(preset)
+    })
+  }, [])
 
-  const handlePanelMouseEnter = () => {
-    clearHideXTimer()
-    setIsHoveringPanel(true)
-  }
+  /**
+   * Apply an S/M/L/XL preset to the PANEL.
+   *
+   * The previous implementation lived inside OverlaySizePicker and called
+   * window:set-overlay-bounds, which resized the fullscreen overlay
+   * BrowserWindow. The window jumped to the preset's corner, and dragging broke
+   * afterwards because useOverlayDrag clamps the panel against
+   * window.innerWidth/Height - which had just collapsed to the preset size.
+   *
+   * Routing through placeOverlayPanel, the same helper the drag rails and the
+   * expand/collapse effects use, means a preset gets identical treatment to a
+   * manual resize: clamped to the work area, and growing down when there is room
+   * below or up when the card is parked on the bottom edge. Nothing repositions
+   * except as required to keep the card on screen.
+   */
+  const applyPanelSize = useCallback(
+    (dimensions: OverlayDimensions) => {
+      const { panelRight: r, panelBottom: b, panelHeight: h, safeInsets: insets } = layoutRef.current
+      const previousHeight =
+        panelColumnRef.current?.offsetHeight ?? h ?? OVERLAY_DEFAULT_COMPACT_HEIGHT
+      const placed = placeOverlayPanel({
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        insets,
+        width: dimensions.width,
+        height: dimensions.height,
+        right: r,
+        bottom: b,
+        previousHeight,
+      })
+      setPanelWidth(placed.width)
+      setPanelHeight(placed.height)
+      setPanelRight(placed.right)
+      setPanelBottom(placed.bottom)
+    },
+    [setPanelWidth, setPanelHeight, setPanelRight, setPanelBottom, OVERLAY_DEFAULT_COMPACT_HEIGHT],
+  )
 
-  const handlePanelMouseLeave = () => {
-    clearHideXTimer()
-    hideXTimerRef.current = setTimeout(() => {
-      setIsHoveringPanel(false)
-    }, 220)
-  }
+  // Held in a ref so the hotkey subscription above can stay mounted for the
+  // life of the component instead of resubscribing whenever applyPanelSize is
+  // rebuilt - a resubscribe race is how a hotkey ends up silently dead.
+  const applyPanelSizeRef = useRef(applyPanelSize)
+  applyPanelSizeRef.current = applyPanelSize
 
   const handleCopyAction = useCallback(async (entryId: string, text: string) => {
     if (!text.trim()) return
@@ -759,7 +868,6 @@ export function OverlayWindow() {
   }, [])
 
   const showBottomResizeRail = hasResponse || isRecording
-  const showX = isHoveringPanel || isHoveringX
 
   useEffect(() => {
     if (hasResponse && activeTab !== 'responses') {
@@ -872,6 +980,7 @@ export function OverlayWindow() {
       {/* Controller Pill - Centered */}
       <div
         ref={pillWrapperRef}
+        data-overlay-interactive=""
         className="relative z-[70] w-fit self-center pointer-events-auto"
         style={{
           WebkitAppRegion: 'drag',
@@ -895,10 +1004,9 @@ export function OverlayWindow() {
       {/* Main Panel Wrapper */}
       <div
         ref={panelWrapperRef}
+        data-overlay-interactive=""
         className={`relative pointer-events-auto ${isPanelExpanded ? 'flex-1 min-h-0' : ''}`}
         style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
-        onMouseEnter={handlePanelMouseEnter}
-        onMouseLeave={handlePanelMouseLeave}
       >
         {stealthEnabled && (
           <div
@@ -979,68 +1087,91 @@ export function OverlayWindow() {
           </div>
         )}
 
-        {/* X Button - dedicated hit wrapper for stable hover/click */}
-        {showX && (
-          <div
-            onMouseEnter={() => {
-              clearHideXTimer()
-              setIsHoveringX(true)
-            }}
-            onMouseLeave={() => setIsHoveringX(false)}
-            className="absolute -top-3 -right-3 z-20 w-8 h-8 pointer-events-auto flex items-center justify-center"
-            style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
-          >
-            <button
-              type="button"
-              onClick={handleClear}
-              className="w-7 h-7 flex items-center justify-center rounded-full bg-[#3a3a3a] hover:bg-[#4a4a4a] text-white/70 hover:text-white transition-all"
-              style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
-                <path d="M18 6L6 18M6 6l12 12" />
-              </svg>
-            </button>
-          </div>
-        )}
-
         {/* Panel Container */}
         <div
-          className={`relative z-[1] rounded-2xl overflow-hidden flex flex-col ${isPanelExpanded ? 'h-full' : ''}`}
+          /* No overflow-hidden: it clipped the control bar's own dropdowns
+             (mode list, settings popover) at the panel edge, which on a
+             collapsed panel meant they were cut off a few pixels below the
+             bar. The two scrolling regions inside - transcript and responses -
+             already clip themselves, so this only guarded the corner radius. */
+          className={`relative z-[1] rounded-2xl flex flex-col ${isPanelExpanded ? 'h-full' : ''}`}
           style={{
             background: stealthEnabled ? '#18171c80' : '#18171ccc',
             boxShadow: '0 0 0 1px rgba(207,226,255,0.24), 0 -0.5px 0 0 rgba(255,255,255,0.8)',
           }}
         >
 
-          {/* Tab Bar - visible when panel is expanded (recording or has responses) */}
-          {isPanelExpanded && (
-            <div className="flex px-4 border-b border-white/10 shrink-0">
-              {(hasResponse || !isRecording) && (
+          {/* Control bar.
+              This was gated on isPanelExpanded (= hasResponse || isRecording),
+              so mode, size and AI settings only existed once you were already
+              recording or already had an answer. Idle - exactly when you sit
+              down to pick a model or paste a key - the panel was an input box
+              and a send button with no route to any of it. That is the wrong
+              way round, so the bar is now permanent and only the TABS come and
+              go: Responses/Transcript have nothing to show until there is a
+              session, but the controls always do. */}
+          <div className="flex px-4 border-b border-white/10 shrink-0">
+            {isPanelExpanded && (
+              /* shrink-0, NOT a clipping wrapper. Letting the tabs absorb the
+                 overflow truncated "Transcript" down to "T". The row now fits
+                 by carrying less: the four size presets moved into the gear
+                 popover, so nothing here has to shrink or be cut. */
+              <div className="flex shrink-0">
+                {(hasResponse || !isRecording) && (
+                  <button
+                    onClick={() => setActiveTab('responses')}
+                    className={`px-3 py-2 text-xs font-medium transition-colors border-b-2 ${
+                      activeTab === 'responses'
+                        ? 'text-white border-[#4169E1]'
+                        : 'text-white/50 border-transparent hover:text-white/70'
+                    }`}
+                    style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
+                  >
+                    Responses
+                  </button>
+                )}
                 <button
-                  onClick={() => setActiveTab('responses')}
+                  onClick={() => setActiveTab('transcript')}
                   className={`px-3 py-2 text-xs font-medium transition-colors border-b-2 ${
-                    activeTab === 'responses'
+                    activeTab === 'transcript'
                       ? 'text-white border-[#4169E1]'
                       : 'text-white/50 border-transparent hover:text-white/70'
                   }`}
                   style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
                 >
-                  Responses
+                  Transcript
                 </button>
-              )}
-              <button
-                onClick={() => setActiveTab('transcript')}
-                className={`px-3 py-2 text-xs font-medium transition-colors border-b-2 ${
-                  activeTab === 'transcript'
-                    ? 'text-white border-[#4169E1]'
-                    : 'text-white/50 border-transparent hover:text-white/70'
-                }`}
-                style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
-              >
-                Transcript
-              </button>
+              </div>
+            )}
+
+            {/* ml-auto right-aligns these whether or not the tabs are
+                present, so the collapsed bar is just this cluster. */}
+            <div
+              className="ml-auto shrink-0 flex items-center gap-1 pr-1"
+              style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
+            >
+              <ModePicker />
+              {/* The dashboard shortcut used to be a bare grid icon here,
+                  directly left of the settings gear. Two unlabeled icons
+                  side by side, one of which raises a full window over the
+                  meeting, made mis-clicks routine - so it moved inside the
+                  gear popover as a labeled "Open dashboard" row. */}
+              <AiSettingsPopover
+                sizeControl={
+                  <OverlaySizePicker
+                    current={{ width: panelWidth, height: panelHeight ?? OVERLAY_DEFAULT_COMPACT_HEIGHT }}
+                    onSelect={applyPanelSize}
+                  />
+                }
+              />
+              {/* No hide button here.
+                  There were three, all calling the same function: this one, a
+                  floating X at the panel's outer corner, and the pill's
+                  "^ Hide" - and handleClear was byte-for-byte identical to
+                  handleHide. The pill's is labelled, always visible, and hints
+                  at the shortcut, so it is the one that survives. */}
             </div>
-          )}
+          </div>
 
           {/* Transcript Tab */}
           {isPanelExpanded && activeTab === 'transcript' && (
@@ -1085,7 +1216,7 @@ export function OverlayWindow() {
                               : 'opacity-0 pointer-events-none text-white/40'
                           } hover:opacity-100 hover:text-white hover:scale-125 active:scale-90`}
                           style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
-                          title={copiedMessageId === entry.id ? 'Copied' : 'Copy'}
+                          aria-label={copiedMessageId === entry.id ? 'Copied' : 'Copy'}
                         >
                           {copiedMessageId === entry.id ? (
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
@@ -1202,7 +1333,7 @@ export function OverlayWindow() {
                               : 'opacity-0 pointer-events-none text-white/40'
                           } hover:opacity-100 hover:text-white hover:scale-125 active:scale-90`}
                           style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
-                          title={copiedMessageId === `resp-${entry.id}` ? 'Copied' : 'Copy'}
+                          aria-label={copiedMessageId === `resp-${entry.id}` ? 'Copied' : 'Copy'}
                         >
                           {copiedMessageId === `resp-${entry.id}` ? (
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none">

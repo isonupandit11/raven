@@ -26,6 +26,30 @@ export function useMousePassthrough(refs: HitTestRefs) {
     return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
   }, [])
 
+  /**
+   * DOM hit test, used IN ADDITION to the rect checks below.
+   *
+   * The rect checks only know about six fixed containers, so anything that
+   * escapes their bounds stops receiving clicks even while it is plainly
+   * visible - which is what happened to the control bar's dropdowns once they
+   * were allowed to extend past the panel. They are DOM descendants of the
+   * panel wrapper, so asking the document what is actually under the cursor
+   * covers them, and covers any future popover, without another ref.
+   *
+   * elementFromPoint skips pointer-events:none elements and returns what sits
+   * beneath, so the decorative stealth border over the panel does not hide the
+   * panel from this check. Over the transparent backdrop it returns the root,
+   * which carries no marker, so passthrough still works.
+   *
+   * This is OR'd with the rect checks rather than replacing them: it can only
+   * ever add capture, never take it away, so existing behaviour is preserved
+   * even if a marker attribute is missing somewhere.
+   */
+  const isOverMarkedUi = useCallback((x: number, y: number): boolean => {
+    const el = document.elementFromPoint(x, y)
+    return el instanceof Element && !!el.closest('[data-overlay-interactive]')
+  }, [])
+
   const isOverInteractiveUi = useCallback((x: number, y: number): boolean => {
     const check = (ref: RefObject<HTMLDivElement | null>) => {
       const rect = ref.current?.getBoundingClientRect()
@@ -37,9 +61,10 @@ export function useMousePassthrough(refs: HitTestRefs) {
       check(refs.leftRailRef) ||
       check(refs.rightRailRef) ||
       check(refs.bottomRailRef) ||
-      check(refs.notificationRef)
+      check(refs.notificationRef) ||
+      isOverMarkedUi(x, y)
     )
-  }, [isInside, refs.pillWrapperRef, refs.panelWrapperRef, refs.leftRailRef, refs.rightRailRef, refs.bottomRailRef, refs.notificationRef])
+  }, [isInside, isOverMarkedUi, refs.pillWrapperRef, refs.panelWrapperRef, refs.leftRailRef, refs.rightRailRef, refs.bottomRailRef, refs.notificationRef])
 
   useEffect(() => {
     setOverlayMouseIgnore(true)

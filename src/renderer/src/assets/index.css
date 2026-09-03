@@ -13,6 +13,29 @@ button:not(.cursor-default) {
   cursor: pointer;
 }
 
+/*
+ * Cursor privacy (overlay only).
+ *
+ * setContentProtection() removes the overlay's PIXELS from a screen capture,
+ * but the mouse cursor is composited by the capturer, not by us - so it is
+ * still visible to whoever is watching. With the rules above, the pointer
+ * turns into a hand whenever it crosses an invisible button, and an I-beam
+ * over invisible text fields: a viewer sees the cursor glide into empty space
+ * and change shape against nothing. That is a far louder tell than the window
+ * itself would have been.
+ *
+ * 'neutral' pins the cursor to a plain arrow across the whole overlay, so
+ * hovering reveals no structure. 'hidden' removes it entirely while over the
+ * overlay - stealthiest, but disorienting to use.
+ *
+ * Set on <html> by useCursorPrivacy() in the overlay renderer only; the
+ * dashboard keeps normal affordances.
+ */
+html[data-cursor-privacy='neutral'],
+html[data-cursor-privacy='neutral'] * {
+  cursor: default !important;
+}
+
 html, body, #root {
   margin: 0;
   padding: 0;
