@@ -27,7 +27,6 @@ export function Onboarding({ onComplete }: OnboardingProps) {
   useEffect(() => {
     void window.raven.trackClientEvent('onboarding_started')
     // intentionally empty deps - fire once per mount
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
