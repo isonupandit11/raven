@@ -2,16 +2,53 @@ import type { AIProvider, AIMessage, AIContentPart, StreamCallbacks } from './ty
 import { buildOpenAIEffortParams, streamMaxTokensFor } from './types';
 import type OpenAI from 'openai';
 
+/**
+ * Output cap for third-party OpenAI-compatible endpoints.
+ *
+ * streamMaxTokensFor() returns OpenAI's ceilings (up to 128k), which other
+ * vendors reject outright - Gemini 2.5 Flash tops out far lower, so passing
+ * the OpenAI number turns every request into a 400. A conservative cap is
+ * both portable and ample: a spoken answer is a few hundred tokens.
+ */
+const CUSTOM_ENDPOINT_MAX_TOKENS = 8192;
+
+/** Host only - a base URL can carry a key in a query string on some gateways. */
+function hostOf(baseUrl: string): string {
+  try {
+    return new URL(baseUrl).host;
+  } catch {
+    return 'The configured endpoint';
+  }
+}
+
 export class OpenAIProvider implements AIProvider {
   readonly name = 'openai' as const;
   private apiKey: string;
   private model: string;
   private effort?: string;
+  /**
+   * Optional OpenAI-compatible endpoint. Empty = api.openai.com.
+   *
+   * This is how Gemini, Groq, OpenRouter, DeepSeek and a local Ollama are
+   * reached without writing a provider per vendor: they all speak the
+   * /chat/completions wire format. Gemini's is
+   * https://generativelanguage.googleapis.com/v1beta/openai
+   *
+   * Any host used here must also be in the renderer CSP connect-src
+   * (windowManager.applyCSP) or the request fails with no useful error.
+   */
+  private baseUrl?: string;
 
-  constructor(apiKey: string, model: string, effort?: string) {
+  constructor(apiKey: string, model: string, effort?: string, baseUrl?: string) {
     this.apiKey = apiKey;
     this.model = model;
     this.effort = effort;
+    this.baseUrl = baseUrl?.trim() || undefined;
+  }
+
+  /** Client options; baseURL is omitted entirely when unset so the SDK default applies. */
+  private clientOptions(): { apiKey: string; baseURL?: string } {
+    return this.baseUrl ? { apiKey: this.apiKey, baseURL: this.baseUrl } : { apiKey: this.apiKey };
   }
 
   async streamResponse(
@@ -19,7 +56,7 @@ export class OpenAIProvider implements AIProvider {
     callbacks: StreamCallbacks
   ): Promise<void> {
     const OpenAI = (await import('openai')).default;
-    const client = new OpenAI({ apiKey: this.apiKey });
+    const client = new OpenAI(this.clientOptions());
 
     // Build as the SDK's discriminated ChatCompletionMessageParam union
     // rather than a widened { role: 'system' | 'user' | 'assistant' }
@@ -56,7 +93,7 @@ export class OpenAIProvider implements AIProvider {
     try {
       const stream = await client.chat.completions.create({
         model: this.model,
-        max_tokens: params.maxTokens ?? streamMaxTokensFor('openai', this.model),
+        ...this.maxTokensParam(params.maxTokens ?? this.defaultMaxTokens()),
         messages: openaiMessages,
         stream: true,
         ...this.effortParams(),
@@ -76,8 +113,24 @@ export class OpenAIProvider implements AIProvider {
       const status = error != null && typeof error === 'object' && 'status' in error
         ? (error as { status: number }).status
         : undefined;
-      if (status === 401) errorMsg = 'Invalid OpenAI API key. Check settings.';
+      if (status === 401) {
+        errorMsg = this.baseUrl
+          ? 'Endpoint rejected the API key. Check the key and base URL in settings.'
+          : 'Invalid OpenAI API key. Check settings.';
+      }
       else if (status === 429) errorMsg = 'Rate limited. Wait a moment and try again.';
+      else if (status === 404) {
+        // The OpenAI wire format puts the model in the BODY, not the path, so a
+        // 404 here almost always means the endpoint does not recognise the
+        // model - not that the URL is wrong. The SDK surfaces it as "404 status
+        // code (no body)", which tells the user nothing and is what they were
+        // actually staring at while a stale OpenAI model id was being sent to
+        // Gemini.
+        errorMsg = this.baseUrl
+          ? `${hostOf(this.baseUrl)} does not recognise the model "${this.model}". `
+            + 'Pick one from Settings, Model, Fetch list.'
+          : `OpenAI does not recognise the model "${this.model}". Choose a different model in Settings.`;
+      }
       else if (error instanceof Error) errorMsg = `AI error: ${error.message}`;
       callbacks.onError(errorMsg);
       throw error;
@@ -90,7 +143,7 @@ export class OpenAIProvider implements AIProvider {
     maxTokens?: number;
   }): Promise<string> {
     const OpenAI = (await import('openai')).default;
-    const client = new OpenAI({ apiKey: this.apiKey });
+    const client = new OpenAI(this.clientOptions());
 
     const messages: Array<{ role: 'system' | 'user'; content: string }> = [];
     if (params.system) {
@@ -100,7 +153,7 @@ export class OpenAIProvider implements AIProvider {
 
     const response = await client.chat.completions.create({
       model: this.model,
-      max_tokens: streamMaxTokensFor('openai', this.model),
+      ...this.maxTokensParam(this.defaultMaxTokens()),
       messages,
       ...this.effortParams(),
     });
@@ -108,7 +161,43 @@ export class OpenAIProvider implements AIProvider {
     return response.choices[0]?.message?.content?.trim() || '';
   }
 
+  private defaultMaxTokens(): number {
+    return this.baseUrl ? CUSTOM_ENDPOINT_MAX_TOKENS : streamMaxTokensFor('openai', this.model);
+  }
+
+  /**
+   * The token-limit parameter this endpoint accepts.
+   *
+   * Every model in our OpenAI catalog (GPT-5.2 through 5.6) is a reasoning
+   * model, and those reject `max_tokens` outright: "Unsupported parameter:
+   * 'max_tokens' is not supported with this model. Use
+   * 'max_completion_tokens' instead." So first-party OpenAI must send
+   * max_completion_tokens.
+   *
+   * Adapted from markrod828's fork of upstream, which makes the swap
+   * UNCONDITIONAL on the grounds that "resolveCatalogModel() clamps this.model
+   * to the catalog, so a legacy Chat-Completions-only model can never reach
+   * us". That premise is false here: providerFactory deliberately BYPASSES
+   * resolveCatalogModel when baseUrl is set, precisely so a third-party id like
+   * gemini-2.5-flash passes through untouched. Taking their change as-is would
+   * have sent max_completion_tokens to Gemini, Groq and Ollama, whose
+   * compatibility layers document max_tokens.
+   *
+   * So it is keyed on the endpoint, the same axis everything else here uses:
+   * first-party OpenAI gets the reasoning-model parameter, a custom endpoint
+   * keeps the classic one.
+   */
+  private maxTokensParam(value: number): Record<string, number> {
+    return this.baseUrl ? { max_tokens: value } : { max_completion_tokens: value };
+  }
+
   private effortParams(): Record<string, unknown> {
+    // Reasoning-effort is an OpenAI-specific parameter. Gemini's OpenAI shim,
+    // Groq and most other compatible endpoints reject unknown fields with a
+    // 400 rather than ignoring them, and our MODEL_CATALOG ladders describe
+    // OpenAI models only - so a third-party model id would be looked up
+    // against the wrong table anyway. Send nothing on a custom endpoint.
+    if (this.baseUrl) return {};
     return buildOpenAIEffortParams(this.model, this.effort);
   }
 

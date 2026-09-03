@@ -30,6 +30,143 @@ describe('providerFactory', () => {
     clearProviderCache()
   })
 
+  describe('every slot honours a custom endpoint, not just live assist', () => {
+    // baseUrl used to appear only in getProviderFromStore, so with Gemini
+    // configured the Notes and session-memory slots built OpenAI clients
+    // pointed at api.openai.com - carrying the GEMINI key, since the Gemini
+    // preset stores it in openaiApiKey. A Google AIza... key sent to OpenAI
+    // fails on authentication regardless of account credit, and the model id
+    // came from MODEL_CATALOG, which is how "gpt-5.6-luna" ended up aimed at
+    // Gemini and 404ing.
+    const GEMINI = 'https://generativelanguage.googleapis.com/v1beta/openai'
+
+    const storeWith = (over: Record<string, unknown>) => {
+      mockStoreGet.mockImplementation((key: string) => {
+        const base: Record<string, unknown> = {
+          aiProvider: 'openai',
+          aiBaseUrl: GEMINI,
+          aiModel: 'gemini-2.5-flash',
+          openaiApiKey: 'AIzaTestKey',
+        }
+        return ({ ...base, ...over })[key]
+      })
+    }
+
+    it('routes the notes slot to the endpoint', async () => {
+      storeWith({})
+      const provider = await getNotesProvider()
+      expect(provider).toBeInstanceOf(OpenAIProvider)
+      expect((provider as unknown as { baseUrl?: string }).baseUrl).toBe(GEMINI)
+      expect((provider as unknown as { model: string }).model).toBe('gemini-2.5-flash')
+    })
+
+    it('routes the session-memory slot to the endpoint', async () => {
+      storeWith({})
+      const provider = await getMemoryProvider()
+      expect((provider as unknown as { baseUrl?: string }).baseUrl).toBe(GEMINI)
+      // Not GPT-5.6 Terra, which no third-party endpoint serves.
+      expect((provider as unknown as { model: string }).model).toBe('gemini-2.5-flash')
+    })
+
+    it('routes the deprecated fast slot to the endpoint too', async () => {
+      storeWith({})
+      const provider = await getFastProvider()
+      expect((provider as unknown as { baseUrl?: string }).baseUrl).toBe(GEMINI)
+    })
+
+    it('lets the notes slot pick its own model on the shared endpoint', async () => {
+      // The flexibility the Notes card now exposes: one endpoint, per-slot model.
+      storeWith({ notesModel: 'gemini-2.5-flash-lite' })
+      const provider = await getNotesProvider()
+      expect((provider as unknown as { model: string }).model).toBe('gemini-2.5-flash-lite')
+    })
+
+    it('ignores a notesModel left over from a first-party provider', async () => {
+      // A Luna/Haiku id does not exist on Gemini, so a populated setting is not
+      // the same as a usable one.
+      storeWith({ notesModel: 'gpt-5.6-luna' })
+      const provider = await getNotesProvider()
+      expect((provider as unknown as { model: string }).model).toBe('gemini-2.5-flash')
+    })
+
+    it('does not override when no endpoint is configured', async () => {
+      storeWith({ aiBaseUrl: '' })
+      const provider = await getNotesProvider()
+      expect((provider as unknown as { baseUrl?: string }).baseUrl).toBeUndefined()
+    })
+
+    it('does not override when the provider is anthropic', async () => {
+      // A stale base URL must not resurrect an endpoint for Anthropic, which
+      // does not speak the OpenAI wire format.
+      storeWith({ aiProvider: 'anthropic', anthropicApiKey: 'sk-ant' })
+      const provider = await getNotesProvider()
+      expect(provider).toBeInstanceOf(AnthropicProvider)
+    })
+
+    it('does not override when there is no key for the endpoint', async () => {
+      storeWith({ openaiApiKey: '', anthropicApiKey: 'sk-ant', notesProvider: 'anthropic' })
+      const provider = await getNotesProvider()
+      expect(provider).toBeInstanceOf(AnthropicProvider)
+    })
+  })
+
+  describe('custom OpenAI-compatible endpoint (baseUrl)', () => {
+    it('treats baseUrl as part of provider identity so switching endpoint invalidates the cache', () => {
+      const a = getProvider({ provider: 'openai', model: 'gpt-5.2', apiKey: 'k' })
+      expect(getProvider({ provider: 'openai', model: 'gpt-5.2', apiKey: 'k' })).toBe(a)
+
+      const withBase = getProvider({
+        provider: 'openai',
+        model: 'gpt-5.2',
+        apiKey: 'k',
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+      })
+
+      // Before baseUrl was part of configKey this returned the cached client
+      // still pointed at api.openai.com, so changing endpoint silently did
+      // nothing until restart.
+      expect(withBase).not.toBe(a)
+    })
+
+    it('passes a third-party model id through instead of substituting a catalog default', async () => {
+      mockStoreGet.mockImplementation((key: string) => {
+        switch (key) {
+          case 'aiProvider': return 'openai'
+          case 'aiModel': return 'gemini-2.5-flash'
+          case 'aiBaseUrl': return 'https://generativelanguage.googleapis.com/v1beta/openai'
+          case 'openaiApiKey': return 'k'
+          default: return ''
+        }
+      })
+
+      const provider = (await getProviderFromStore()) as unknown as { model: string; baseUrl?: string }
+
+      // resolveCatalogModel() only knows OpenAI's own catalog and silently
+      // falls back to DEFAULT_MODELS, which would have sent an OpenAI model
+      // id to Gemini and failed.
+      expect(provider).toBeInstanceOf(OpenAIProvider)
+      expect(provider.model).toBe('gemini-2.5-flash')
+      expect(provider.baseUrl).toBe('https://generativelanguage.googleapis.com/v1beta/openai')
+    })
+
+    it('still applies the OpenAI catalog when no baseUrl is set', async () => {
+      mockStoreGet.mockImplementation((key: string) => {
+        switch (key) {
+          case 'aiProvider': return 'openai'
+          case 'aiModel': return 'not-a-real-model'
+          case 'aiBaseUrl': return ''
+          case 'openaiApiKey': return 'k'
+          default: return ''
+        }
+      })
+
+      const provider = (await getProviderFromStore()) as unknown as { model: string; baseUrl?: string }
+
+      expect(provider.model).not.toBe('not-a-real-model')
+      expect(provider.baseUrl).toBeUndefined()
+    })
+  })
+
   describe('getProvider', () => {
     it('creates AnthropicProvider for anthropic config', () => {
       const provider = getProvider({

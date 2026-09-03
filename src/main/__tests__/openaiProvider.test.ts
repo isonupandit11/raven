@@ -1,11 +1,10 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest'
 
-const { mockCreate } = vi.hoisted(() => ({
-  mockCreate: vi.fn(),
-}))
-
-vi.mock('openai', () => ({
-  default: vi.fn(function () {
+const { mockCreate, mockOpenAICtor } = vi.hoisted(() => {
+  const mockCreate = vi.fn()
+  // Hoisted so tests can assert the options the SDK was constructed with
+  // (notably baseURL for custom OpenAI-compatible endpoints).
+  const mockOpenAICtor = vi.fn(function () {
     return {
       chat: {
         completions: {
@@ -13,7 +12,12 @@ vi.mock('openai', () => ({
         },
       },
     }
-  }),
+  })
+  return { mockCreate, mockOpenAICtor }
+})
+
+vi.mock('openai', () => ({
+  default: mockOpenAICtor,
 }))
 
 import { OpenAIProvider } from '../services/ai/openaiProvider'
@@ -27,6 +31,64 @@ describe('OpenAIProvider', () => {
 
   it('has name "openai"', () => {
     expect(provider.name).toBe('openai')
+  })
+
+  describe('custom OpenAI-compatible endpoint (baseUrl)', () => {
+    const ok = (): void => {
+      mockCreate.mockResolvedValueOnce({ choices: [{ message: { content: 'x' } }] })
+    }
+
+    it('omits baseURL entirely when unset so the SDK default applies', async () => {
+      ok()
+      await new OpenAIProvider('sk-test', 'gpt-5.2').generateShort({ prompt: 'p' })
+      expect(mockOpenAICtor).toHaveBeenLastCalledWith({ apiKey: 'sk-test' })
+    })
+
+    it('treats a whitespace-only baseUrl as unset', async () => {
+      ok()
+      await new OpenAIProvider('sk-test', 'gpt-5.2', undefined, '   ').generateShort({ prompt: 'p' })
+      expect(mockOpenAICtor).toHaveBeenLastCalledWith({ apiKey: 'sk-test' })
+    })
+
+    it('passes baseURL to the SDK when set', async () => {
+      ok()
+      await new OpenAIProvider(
+        'k',
+        'gemini-2.5-flash',
+        'low',
+        'https://generativelanguage.googleapis.com/v1beta/openai',
+      ).generateShort({ prompt: 'p' })
+      expect(mockOpenAICtor).toHaveBeenLastCalledWith({
+        apiKey: 'k',
+        baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
+      })
+    })
+
+    it('suppresses reasoning_effort on a custom endpoint (other vendors 400 on unknown fields)', async () => {
+      ok()
+      await new OpenAIProvider('k', 'gemini-2.5-flash', 'high', 'https://example.test/v1')
+        .generateShort({ prompt: 'p' })
+      expect(mockCreate).toHaveBeenLastCalledWith(
+        expect.not.objectContaining({ reasoning_effort: expect.anything() }),
+      )
+    })
+
+    it('still sends reasoning_effort against the real OpenAI endpoint', async () => {
+      ok()
+      await new OpenAIProvider('k', 'gpt-5.2', 'high').generateShort({ prompt: 'p' })
+      expect(mockCreate).toHaveBeenLastCalledWith(
+        expect.objectContaining({ reasoning_effort: 'high' }),
+      )
+    })
+
+    it('caps max_tokens on a custom endpoint rather than sending OpenAI ceilings', async () => {
+      ok()
+      await new OpenAIProvider('k', 'gemini-2.5-flash', undefined, 'https://example.test/v1')
+        .generateShort({ prompt: 'p' })
+      expect(mockCreate).toHaveBeenLastCalledWith(
+        expect.objectContaining({ max_tokens: 8192 }),
+      )
+    })
   })
 
   describe('generateShort', () => {
@@ -43,7 +105,7 @@ describe('OpenAIProvider', () => {
       expect(mockCreate).toHaveBeenCalledWith(
         expect.objectContaining({
           model: 'gpt-5.2',
-          max_tokens: 128000,
+          max_completion_tokens: 128000,
           messages: [{ role: 'user', content: 'Generate something' }],
         })
       )
@@ -62,7 +124,7 @@ describe('OpenAIProvider', () => {
 
       expect(mockCreate).toHaveBeenCalledWith(
         expect.objectContaining({
-          max_tokens: 128000,
+          max_completion_tokens: 128000,
           messages: [
             { role: 'system', content: 'Be concise' },
             { role: 'user', content: 'Test' },
@@ -97,7 +159,7 @@ describe('OpenAIProvider', () => {
       await provider.generateShort({ prompt: 'summarize', maxTokens: 2000 })
       expect(mockCreate).toHaveBeenCalledWith(
         expect.objectContaining({
-          max_tokens: 128000,
+          max_completion_tokens: 128000,
           reasoning_effort: 'max',
         }),
       )
@@ -166,9 +228,35 @@ describe('OpenAIProvider', () => {
       expect(mockCreate).toHaveBeenCalledWith(
         expect.objectContaining({
           stream: true,
-          max_tokens: 512,
+          // First-party OpenAI: every catalog model is a reasoning model and
+          // those reject max_tokens outright.
+          max_completion_tokens: 512,
         })
       )
+    })
+
+    it('keeps max_tokens on a custom endpoint, even with an explicit limit', async () => {
+      // The adaptation of markrod828's fix. Their version swaps the parameter
+      // unconditionally, reasoning that resolveCatalogModel clamps the model to
+      // OpenAI's catalog - but providerFactory deliberately bypasses that when
+      // baseUrl is set, so an unconditional swap would send
+      // max_completion_tokens to Gemini, Groq and Ollama, which document
+      // max_tokens.
+      mockCreate.mockResolvedValueOnce({
+        [Symbol.asyncIterator]: async function* () {
+          // empty stream
+        },
+      })
+
+      await new OpenAIProvider('k', 'gemini-2.5-flash', undefined, 'https://example.test/v1')
+        .streamResponse(
+          { messages: [{ role: 'user', content: 'Hi' }], maxTokens: 512 },
+          { onText: vi.fn(), onDone: vi.fn(), onError: vi.fn() },
+        )
+
+      const sent = mockCreate.mock.calls.at(-1)?.[0] as Record<string, unknown>
+      expect(sent.max_tokens).toBe(512)
+      expect(sent).not.toHaveProperty('max_completion_tokens')
     })
 
     it('defaults omitted max_tokens to the official 128k model max', async () => {
@@ -182,7 +270,7 @@ describe('OpenAIProvider', () => {
       )
 
       expect(mockCreate).toHaveBeenCalledWith(
-        expect.objectContaining({ max_tokens: 128000 })
+        expect.objectContaining({ max_completion_tokens: 128000 })
       )
     })
 

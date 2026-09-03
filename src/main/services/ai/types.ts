@@ -7,6 +7,15 @@ export interface AIProviderConfig {
   model: string;
   apiKey: string;
   effort?: string;
+  /**
+   * Optional OpenAI-compatible base URL, honoured by the 'openai' provider
+   * only. Lets one provider reach Gemini, Groq, OpenRouter, DeepSeek or a
+   * local Ollama without a class per vendor. Empty = api.openai.com.
+   *
+   * Must be reflected in configKey() so a change invalidates the cached
+   * client, and the host must be allowed by the renderer CSP.
+   */
+  baseUrl?: string;
 }
 
 export interface StreamCallbacks {
