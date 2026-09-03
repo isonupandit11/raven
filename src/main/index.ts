@@ -48,6 +48,7 @@ if (process.platform === 'win32') {
 }
 import type WebSocket from 'ws'
 import { registerIpcHandlers } from './ipc'
+import { setUnavailableShortcuts, collectUnavailable } from './shortcutStatus'
 import {
   createDashboardWindow,
   createOverlayWindow,
@@ -204,7 +205,7 @@ function registerGlobalHotkeys(
   // which hijacked the browser's refresh in every app while Raven ran.
   // Shift+Space is effectively never bound globally by other apps.
   // Only the overlay subscribes to 'hotkey:toggle-recording'
-  // (OverlayWindow / OverlayToolbar). The dashboard uses its own
+  // (OverlayWindow). The dashboard uses its own
   // dashboard-scoped keyboard shortcut which it relays to main via
   // `sendHotkeyToggleRecording` → 'hotkey:toggle-recording-from-dashboard'
   // handled in ipc.ts. The previous extra `dashboardWindow.send(...)` here
@@ -260,14 +261,82 @@ function registerGlobalHotkeys(
     }
   })
 
+  // Keyboard access to the overlay's own controls.
+  //
+  // These exist so the cursor never has to enter the overlay at all. Content
+  // protection hides the panel's pixels from a screen capture, but the mouse
+  // pointer is drawn by the capturer - so reaching for the mode picker makes
+  // the viewer watch a cursor travel into blank space and click nothing. A
+  // shortcut moves no cursor, which is a complete fix rather than a mitigation.
+  //
+  // All Ctrl+Shift+ prefixed, following the existing convention here: these are
+  // SYSTEM-WIDE registrations, and plain Ctrl+M / Ctrl+K would hijack those
+  // keys in every other app while Raven runs (the same mistake that made
+  // Ctrl+R the recording key and stole refresh from every browser).
+  const modePickerRegistered = globalShortcut.register(`${modifier}+Shift+M`, () => {
+    if (overlayWindow && !overlayWindow.isDestroyed()) {
+      overlayWindow.webContents.send('hotkey:open-mode-picker')
+      if (!overlayWindow.isVisible()) showOverlayWindow()
+    }
+  })
+
+  const aiSettingsRegistered = globalShortcut.register(`${modifier}+Shift+K`, () => {
+    if (overlayWindow && !overlayWindow.isDestroyed()) {
+      overlayWindow.webContents.send('hotkey:open-ai-settings')
+      if (!overlayWindow.isVisible()) showOverlayWindow()
+    }
+  })
+
+  // Direct rather than incremental: Ctrl+Shift+1..4 picks S/M/L/XL outright, so
+  // there is no "press until it looks right" loop and no dependence on the
+  // current size. Digits are also the accelerator tokens least likely to vary
+  // by keyboard layout - bracket and plus/minus keys move around.
+  const OVERLAY_SIZE_KEYS: ReadonlyArray<[string, 'S' | 'M' | 'L' | 'XL']> = [
+    ['1', 'S'],
+    ['2', 'M'],
+    ['3', 'L'],
+    ['4', 'XL'],
+  ]
+  const sizeRegistrations: Array<[string, boolean]> = OVERLAY_SIZE_KEYS.map(([key, size]) => {
+    const accelerator = `${modifier}+Shift+${key}`
+    const ok = globalShortcut.register(accelerator, () => {
+      if (overlayWindow && !overlayWindow.isDestroyed()) {
+        overlayWindow.webContents.send('hotkey:set-overlay-size', size)
+        if (!overlayWindow.isVisible()) showOverlayWindow()
+      }
+    })
+    return [accelerator, ok]
+  })
+
   log.info('Hotkeys registered:', {
     visibility: visibilityRegistered,
     aiSuggestion: aiRegistered,
     recording: recordingRegistered,
     clear: clearRegistered,
     scrollUp: scrollUpRegistered,
-    scrollDown: scrollDownRegistered
+    scrollDown: scrollDownRegistered,
+    modePicker: modePickerRegistered,
+    aiSettings: aiSettingsRegistered,
+    sizes: sizeRegistrations.map(([, ok]) => ok),
   })
+
+  // A refused accelerator used to be logged and then forgotten, so the user
+  // pressed a key, nothing happened, and nothing explained why. Global
+  // shortcuts are first-come-first-served across the OS, so this is routine
+  // (another overlay tool holding Ctrl+\ is enough). Record it for the UI.
+  setUnavailableShortcuts(
+    collectUnavailable([
+      [`${modifier}+\\`, visibilityRegistered],
+      [`${modifier}+Return`, aiRegistered],
+      [`${modifier}+Shift+Space`, recordingRegistered],
+      [`${modifier}+Shift+Backspace`, clearRegistered],
+      [`${modifier}+Shift+Up`, scrollUpRegistered],
+      [`${modifier}+Shift+Down`, scrollDownRegistered],
+      [`${modifier}+Shift+M`, modePickerRegistered],
+      [`${modifier}+Shift+K`, aiSettingsRegistered],
+      ...sizeRegistrations,
+    ]),
+  )
 
   // Window move (Cmd+Arrow) registered above - requires Accessibility permission on macOS.
 
