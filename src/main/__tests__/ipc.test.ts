@@ -10,6 +10,7 @@ const {
   mockSaveSetting,
   mockSaveSettings,
   mockSaveApiKeys,
+  mockSaveAiProviderKey,
   mockHasApiKeys,
   mockClearApiKeys,
   mockIsFreeMode,
@@ -21,6 +22,7 @@ const {
   mockSaveSetting: vi.fn(),
   mockSaveSettings: vi.fn(),
   mockSaveApiKeys: vi.fn(),
+  mockSaveAiProviderKey: vi.fn(),
   mockHasApiKeys: vi.fn().mockReturnValue(true),
   mockClearApiKeys: vi.fn(),
   mockIsFreeMode: vi.fn().mockReturnValue(true),
@@ -119,6 +121,7 @@ vi.mock('../store', () => ({
   saveSetting: mockSaveSetting,
   saveSettings: mockSaveSettings,
   saveApiKeys: mockSaveApiKeys,
+  saveAiProviderKey: mockSaveAiProviderKey,
   hasApiKeys: mockHasApiKeys,
   clearApiKeys: mockClearApiKeys,
   isFreeMode: mockIsFreeMode,
@@ -326,6 +329,39 @@ describe('IPC Handlers (registerIpcHandlers)', () => {
 
       expect(mockSaveApiKeys).toHaveBeenCalledWith('dg-key', 'ant-key', 'oai-key', extras)
       expect(result).toBe(true)
+    })
+  })
+
+  describe('store:save-ai-key', () => {
+    it('delegates to saveAiProviderKey for openai', () => {
+      const result = handlers['store:save-ai-key'](fakeEvent(), 'openai', 'sk-oai')
+
+      expect(mockSaveAiProviderKey).toHaveBeenCalledWith('openai', 'sk-oai')
+      expect(result).toBe(true)
+    })
+
+    it('delegates to saveAiProviderKey for anthropic', () => {
+      const result = handlers['store:save-ai-key'](fakeEvent(), 'anthropic', 'sk-ant')
+
+      expect(mockSaveAiProviderKey).toHaveBeenCalledWith('anthropic', 'sk-ant')
+      expect(result).toBe(true)
+    })
+
+    // safeHandle converts a throw into { __ipcError, error } rather than
+    // rejecting, so these assert the error envelope, not an exception.
+    it('rejects an unknown provider instead of writing an arbitrary field', () => {
+      const result = handlers['store:save-ai-key'](fakeEvent(), 'gemini', 'k')
+
+      expect(result).toMatchObject({ __ipcError: true })
+      expect(result.error).toMatch(/Unknown AI provider/)
+      expect(mockSaveAiProviderKey).not.toHaveBeenCalled()
+    })
+
+    it('rejects a non-string key', () => {
+      const result = handlers['store:save-ai-key'](fakeEvent(), 'openai', 123)
+
+      expect(result).toMatchObject({ __ipcError: true })
+      expect(mockSaveAiProviderKey).not.toHaveBeenCalled()
     })
   })
 

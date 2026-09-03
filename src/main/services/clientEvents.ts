@@ -55,11 +55,16 @@ import { createLogger } from '../logger'
 
 const log = createLogger('ClientEvents')
 
-const FLUSH_INTERVAL_MS = 10_000
+// Underscore-prefixed because nothing reads them any more: they described the
+// upload cadence and the platform/version fields sent with each batch, and this
+// build has no hosted backend to upload to. Kept rather than deleted so the
+// shape of that payload is still documented if one returns. The lint config
+// allows unused names matching /^_/.
+const _FLUSH_INTERVAL_MS = 10_000
 const FLUSH_AT = 20
 const MAX_BUFFER = 200
-const PLATFORM = process.platform
-const VERSION = app.getVersion()
+const _PLATFORM = process.platform
+const _VERSION = app.getVersion()
 
 /**
  * Allowlist mirrors the backend's ALLOWED_EVENT_NAMES set.
@@ -112,7 +117,10 @@ interface QueuedEvent {
 let buffer: QueuedEvent[] = []
 let flushTimer: ReturnType<typeof setInterval> | null = null
 let initialized = false
-let flushInFlight = false
+// Removed: a `flushInFlight` re-entrancy guard for the upload that no longer
+// happens. It was written in two places and read in none, so it guarded
+// nothing - which is why eslint reported it as "assigned but never used"
+// rather than as unreferenced.
 
 /**
  * Initialize the periodic flush timer. Safe to call multiple
@@ -223,7 +231,6 @@ export function _resetForTests(): void {
     clearInterval(flushTimer)
     flushTimer = null
   }
-  flushInFlight = false
 }
 export function _flushForTests(): Promise<void> {
   return flush()

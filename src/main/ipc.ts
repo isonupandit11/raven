@@ -5,6 +5,7 @@ import {
   saveSetting,
   saveSettings,
   saveApiKeys,
+  saveAiProviderKey,
   hasApiKeys,
   clearApiKeys,
   isFreeMode,
@@ -12,6 +13,8 @@ import {
   resetAll
 } from './store'
 import type { LocalSettings } from './store'
+import { clampOverlayOpacity } from '../shared/overlayOpacity'
+import { getUnavailableShortcuts } from './shortcutStatus'
 import {
   toggleOverlay,
   showOverlay,
@@ -133,6 +136,50 @@ export function registerIpcHandlers(): void {
     }
   )
 
+  // Partial key update. store:save-api-keys overwrites the Deepgram and
+  // Anthropic keys unconditionally, so a caller that only knows the OpenAI key
+  // cannot use it without destroying the others.
+  safeHandle('store:save-ai-key', (provider: string, key: string) => {
+    if (provider !== 'anthropic' && provider !== 'openai') {
+      throw new Error(`Unknown AI provider: ${provider}`)
+    }
+    assertString(key, 'key', 500)
+    saveAiProviderKey(provider, key)
+    return true
+  })
+
+  /**
+   * Ask the configured endpoint which models it serves.
+   *
+   * In main because that is where the API key lives and where no renderer CSP
+   * applies. Reads provider / baseUrl / key from the store rather than taking
+   * them as arguments, so the renderer cannot aim this at an arbitrary host
+   * with the user's key.
+   *
+   * Errors are returned as a value, not thrown: the caller is a settings
+   * popover that needs to show "401 - key rejected" next to the field rather
+   * than lose it to an unhandled rejection.
+   */
+  safeHandle('ai:list-models', async () => {
+    const { getApiKey } = await import('./store')
+    const provider = ((getSetting('aiProvider') as string) || 'anthropic') as
+      | 'anthropic'
+      | 'openai'
+    const baseUrl =
+      provider === 'openai' ? ((getSetting('aiBaseUrl') as string) || '').trim() : ''
+    const apiKey = getApiKey(provider === 'openai' ? 'openaiApiKey' : 'anthropicApiKey')
+
+    try {
+      const { fetchRemoteModels } = await import('./services/ai/modelList')
+      const models = await fetchRemoteModels({ provider, apiKey, baseUrl })
+      return { models }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      ipcLog.warn('Model list fetch failed:', message)
+      return { models: [], error: message }
+    }
+  })
+
   safeHandle('store:has-api-keys', () => {
     return hasApiKeys()
   })
@@ -175,7 +222,13 @@ export function registerIpcHandlers(): void {
     'validate-keys', 2000,
     async (deepgramKey: string, aiProvider: 'anthropic' | 'openai', aiKey: string) => {
       const { validateKeys } = await import('./validators')
-      return validateKeys(deepgramKey, aiProvider, aiKey)
+      // The 'openai' provider is also how Gemini / Groq / OpenRouter / Ollama
+      // are reached, so validate against the endpoint the key will actually be
+      // sent to. Read here rather than taken from the renderer so the probe
+      // target cannot be pointed anywhere the user has not configured.
+      const baseUrl =
+        aiProvider === 'openai' ? ((getSetting('aiBaseUrl') as string) || '').trim() : undefined
+      return validateKeys(deepgramKey, aiProvider, aiKey, baseUrl)
     }
   )
 
@@ -393,6 +446,26 @@ export function registerIpcHandlers(): void {
       return true
     }
   )
+
+  // Accelerators the OS refused, so the overlay can say so instead of leaving
+  // the user pressing a dead key. Pull-based rather than pushed at startup:
+  // registration happens before the overlay renderer is listening, so a
+  // broadcast would be sent to nobody.
+  safeHandle('shortcuts:get-unavailable', () => {
+    return getUnavailableShortcuts()
+  })
+
+  // Overlay opacity. Clamped in shared code so the renderer's slider and the
+  // main process cannot disagree about the legal range, and so a corrupt stored
+  // value falls back to opaque rather than to the transparent floor.
+  safeHandle('window:set-overlay-opacity', (value: unknown) => {
+    const overlay = getOverlayWindow()
+    if (!overlay || overlay.isDestroyed()) return false
+    const opacity = clampOverlayOpacity(value)
+    overlay.setOpacity(opacity)
+    saveSetting('overlayOpacity', opacity)
+    return opacity
+  })
 
   safeHandle('window:show-dashboard', () => {
     const dashboard = getDashboardWindow()

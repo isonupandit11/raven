@@ -12,6 +12,17 @@ contextBridge.exposeInMainWorld('raven', {
     openaiKey?: string,
     extras?: { assemblyaiApiKey?: string; recallApiKey?: string },
   ) => ipcRenderer.invoke('store:save-api-keys', deepgramKey, anthropicKey, openaiKey, extras),
+  // Sets one AI provider key without disturbing the others. apiKeysSave
+  // overwrites the Deepgram and Anthropic keys unconditionally, and secrets
+  // cannot be read back, so it is unusable for a partial update.
+  aiKeySave: (provider: 'anthropic' | 'openai', key: string) =>
+    ipcRenderer.invoke('store:save-ai-key', provider, key),
+  windowSetOverlayOpacity: (value: number) =>
+    ipcRenderer.invoke('window:set-overlay-opacity', value),
+  shortcutsGetUnavailable: () => ipcRenderer.invoke('shortcuts:get-unavailable'),
+  // No arguments by design: main reads provider/endpoint/key from the store, so
+  // the renderer cannot point this at an arbitrary host with the user's key.
+  aiListModels: () => ipcRenderer.invoke('ai:list-models'),
   apiKeysHas: () => ipcRenderer.invoke('store:has-api-keys'),
   apiKeysClear: () => ipcRenderer.invoke('store:clear-api-keys'),
   resetAll: () => ipcRenderer.invoke('store:reset-all'),
@@ -196,6 +207,16 @@ contextBridge.exposeInMainWorld('raven', {
       isFinal: boolean
       fullTranscript: string
       speaker?: number
+      // What the services actually send. `entries` was declared but never
+      // populated on the AssemblyAI path.
+      entry?: {
+        id: string
+        source: 'mic' | 'system'
+        text: string
+        speaker: 'you' | 'them'
+        timestamp: number
+        isFinal: boolean
+      }
       entries?: Array<{
         id: string
         source: 'mic' | 'system'
@@ -391,6 +412,21 @@ contextBridge.exposeInMainWorld('raven', {
     const handler = () => callback()
     ipcRenderer.on('hotkey:scroll-down', handler)
     return () => ipcRenderer.removeListener('hotkey:scroll-down', handler)
+  },
+  onHotkeyOpenModePicker: (callback: () => void) => {
+    const handler = () => callback()
+    ipcRenderer.on('hotkey:open-mode-picker', handler)
+    return () => ipcRenderer.removeListener('hotkey:open-mode-picker', handler)
+  },
+  onHotkeyOpenAiSettings: (callback: () => void) => {
+    const handler = () => callback()
+    ipcRenderer.on('hotkey:open-ai-settings', handler)
+    return () => ipcRenderer.removeListener('hotkey:open-ai-settings', handler)
+  },
+  onHotkeySetOverlaySize: (callback: (size: 'S' | 'M' | 'L' | 'XL') => void) => {
+    const handler = (_event: unknown, size: 'S' | 'M' | 'L' | 'XL') => callback(size)
+    ipcRenderer.on('hotkey:set-overlay-size', handler)
+    return () => ipcRenderer.removeListener('hotkey:set-overlay-size', handler)
   },
   onHotkeyMove: (callback: (direction: 'up' | 'down' | 'left' | 'right') => void) => {
     const handler = (_event: unknown, direction: 'up' | 'down' | 'left' | 'right') => callback(direction)

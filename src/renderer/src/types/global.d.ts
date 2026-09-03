@@ -72,6 +72,16 @@ declare global {
         openaiKey?: string,
         extras?: { assemblyaiApiKey?: string; recallApiKey?: string },
       ) => Promise<boolean>;
+      /** Sets one AI provider key without touching the others (apiKeysSave clobbers). */
+      aiKeySave: (provider: 'anthropic' | 'openai', key: string) => Promise<boolean>;
+      /** Sets overlay opacity; resolves with the value actually applied after clamping. */
+      windowSetOverlayOpacity: (value: number) => Promise<number | false>;
+      /** Accelerators the OS refused (already held by another app). */
+      shortcutsGetUnavailable: () => Promise<string[]>;
+      aiListModels: () => Promise<{
+        models: Array<{ id: string; label: string }>;
+        error?: string;
+      }>;
       apiKeysHas: () => Promise<boolean>;
       apiKeysClear: () => Promise<boolean>;
       resetAll: () => Promise<boolean>;
@@ -229,6 +239,20 @@ declare global {
         isFinal: boolean;
         fullTranscript: string;
         speaker?: number;
+        /**
+         * The single entry that just changed. This is what the transcription
+         * services actually send (see broadcastTranscript); the `entries` array
+         * below was declared but never populated by the AssemblyAI path, so
+         * anything relying on it silently received undefined.
+         */
+        entry?: {
+          id: string;
+          source: 'mic' | 'system';
+          text: string;
+          speaker: 'you' | 'them';
+          timestamp: number;
+          isFinal: boolean;
+        };
         entries?: Array<{
           id: string;
           source: 'mic' | 'system';
@@ -299,8 +323,18 @@ declare global {
       onHotkeyClearConversation: (callback: () => void) => () => void;
       onHotkeyScrollUp: (callback: () => void) => () => void;
       onHotkeyScrollDown: (callback: () => void) => () => void;
+      onHotkeyOpenModePicker: (callback: () => void) => () => void;
+      onHotkeyOpenAiSettings: (callback: () => void) => () => void;
+      onHotkeySetOverlaySize: (callback: (size: 'S' | 'M' | 'L' | 'XL') => void) => () => void;
       onHotkeyMove: (callback: (direction: 'up' | 'down' | 'left' | 'right') => void) => () => void;
       analyticsTrack: (name: string, properties?: Record<string, unknown>) => Promise<void>;
+      /**
+       * Telemetry opt-out. Both have existed in the preload since analytics
+       * landed but were never typed here, which is why analytics.ts notes that
+       * "no in-app UI exposes it" - the renderer could not reach them safely.
+       */
+      analyticsIsEnabled: () => Promise<boolean>;
+      analyticsSetEnabled: (enabled: boolean) => Promise<boolean>;
       trackClientEvent: (
         name: string,
         args?: { sessionId?: string; metadata?: Record<string, unknown> },

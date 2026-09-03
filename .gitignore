@@ -49,6 +49,17 @@ src/native/aec/build/
 src/native/aec/deps/
 src/native/aec/node_modules/
 
+# Native Windows audio module build artifacts (Rust / NAPI-RS).
+# `napi build` emits the .node plus an index.js/index.d.ts binding shim, and
+# cargo's target/ runs to hundreds of MB - none of it belongs in the repo.
+# Without these, a first Windows build leaves six untracked entries including
+# a ~500 KB binary.
+src/native/windows/target/
+src/native/windows/node_modules/
+src/native/windows/*.node
+src/native/windows/index.js
+src/native/windows/index.d.ts
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
