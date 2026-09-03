@@ -16,7 +16,7 @@ vi.mock('electron', () => ({
 }))
 
 import Anthropic from '@anthropic-ai/sdk'
-import { validateDeepgramKey, validateAnthropicKey, validateOpenAIKey, validateBothKeys, validateKeys, validateAssemblyAIKey, validateRecallKey, VALIDATION_TIMEOUT_MS } from '../validators'
+import { validateDeepgramKey, validateAnthropicKey, validateOpenAIKey, validateBothKeys, validateKeys, validateAssemblyAIKey, validateRecallKey, VALIDATION_TIMEOUT_MS, openaiModelsUrl } from '../validators'
 
 function setElectronVersion(value: string | undefined): void {
   Object.defineProperty(process.versions, 'electron', {
@@ -227,7 +227,7 @@ describe('validateOpenAIKey', () => {
 
     const result = await validateOpenAIKey('sk-openai-bad')
 
-    expect(result).toEqual({ valid: false, error: 'Invalid OpenAI API key.' })
+    expect(result).toEqual({ valid: false, error: 'OpenAI rejected this API key.' })
   })
 
   it('returns invalid for 403', async () => {
@@ -235,7 +235,7 @@ describe('validateOpenAIKey', () => {
 
     const result = await validateOpenAIKey('sk-openai-noperm')
 
-    expect(result).toEqual({ valid: false, error: 'OpenAI key does not have permission. Check your plan.' })
+    expect(result).toEqual({ valid: false, error: 'OpenAI denied access with this key. Check your plan.' })
   })
 
   it('returns status message for other errors', async () => {
@@ -349,7 +349,7 @@ describe('validateKeys', () => {
     expect(result.valid).toBe(false)
     expect(result.deepgramError).toBeUndefined()
     expect(result.aiError).toBeDefined()
-    expect(result.error).toBe('Invalid OpenAI API key.')
+    expect(result.error).toBe('OpenAI rejected this API key.')
   })
 
   it('skips Deepgram when the key is empty so Assembly-only setups can validate the LLM key', async () => {
@@ -363,6 +363,126 @@ describe('validateKeys', () => {
       'https://api.anthropic.com/v1/models',
       expect.any(Object),
     )
+  })
+})
+
+describe('validateOpenAIKey endpoint targeting', () => {
+  // The 'openai' provider is also how Gemini / Groq / OpenRouter / Ollama are
+  // reached. Validating against api.openai.com meant a valid Gemini key came
+  // back 401 and Settings said "Invalid OpenAI API key." - blaming the key for
+  // being the wrong shape for a server it was never going to be sent to.
+  it('probes the configured endpoint, not api.openai.com', async () => {
+    const seen: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      seen.push(String(url))
+      return { ok: true, status: 200 }
+    }))
+
+    await validateOpenAIKey('AIzaKey', 'https://generativelanguage.googleapis.com/v1beta/openai')
+
+    expect(seen).toEqual([
+      'https://generativelanguage.googleapis.com/v1beta/openai/models',
+    ])
+  })
+
+  it('falls back to api.openai.com when no endpoint is configured', async () => {
+    const seen: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      seen.push(String(url))
+      return { ok: true, status: 200 }
+    }))
+
+    await validateOpenAIKey('sk-key')
+    await validateOpenAIKey('sk-key', '')
+    await validateOpenAIKey('sk-key', '   ')
+
+    expect(seen).toEqual([
+      'https://api.openai.com/v1/models',
+      'https://api.openai.com/v1/models',
+      'https://api.openai.com/v1/models',
+    ])
+  })
+
+  it('names the endpoint host in the error rather than saying OpenAI', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 401 }))
+    const result = await validateOpenAIKey('AIzaKey', 'https://generativelanguage.googleapis.com/v1beta/openai')
+    expect(result.error).toBe('generativelanguage.googleapis.com rejected this API key.')
+  })
+
+  it('does not call a 404 a bad key', async () => {
+    // An endpoint without /models cannot verify the key. Reporting it as
+    // invalid would send the user to replace a working one.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404 }))
+    const result = await validateOpenAIKey('key', 'http://127.0.0.1:11434/v1')
+    expect(result.valid).toBe(false)
+    expect(result.error).toContain('no /models endpoint')
+    expect(result.error).toContain('may still work')
+  })
+
+  it('builds the probe URL without a double slash', async () => {
+    expect(openaiModelsUrl('https://example.com/v1/')).toBe('https://example.com/v1/models')
+    expect(openaiModelsUrl('https://example.com/v1///')).toBe('https://example.com/v1/models')
+    expect(openaiModelsUrl('https://example.com/v1')).toBe('https://example.com/v1/models')
+  })
+
+  it('validateKeys forwards the endpoint through to the openai probe', async () => {
+    const seen: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      seen.push(String(url))
+      return { ok: true, status: 200 }
+    }))
+
+    await validateKeys('', 'openai', 'AIzaKey', 'https://api.groq.com/openai/v1')
+
+    expect(seen).toEqual(['https://api.groq.com/openai/v1/models'])
+  })
+})
+
+describe('validateAssemblyAIKey targets the streaming path', () => {
+  // GET /v2/account proves only that the key authenticates. Streaming is
+  // separately gated, so a key that passed /v2/account was still refused at the
+  // websocket with "Unauthorized Connection: Insufficient funds" - onboarding
+  // said valid, transcription produced nothing, and nothing said which of the
+  // two was wrong.
+  it('mints a streaming token rather than reading the account', async () => {
+    const seen: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      seen.push(String(url))
+      return { ok: true, status: 200 }
+    }))
+
+    await validateAssemblyAIKey('aai-key')
+
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toContain('streaming.assemblyai.com/v3/token')
+    expect(seen[0]).not.toContain('/v2/account')
+  })
+
+  it('reports a refused-but-authenticated account without blaming the key', async () => {
+    // The key is fine and the account is not. Calling this "invalid key" sends
+    // the user to replace a working credential.
+    for (const status of [402, 403]) {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status }))
+      const result = await validateAssemblyAIKey('aai-key')
+      expect(result.valid).toBe(false)
+      expect(result.error).toContain('refused streaming')
+      expect(result.error).not.toMatch(/invalid/i)
+    }
+  })
+
+  it('still calls a 401 an invalid key', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 401 }))
+    expect(await validateAssemblyAIKey('bad')).toEqual({
+      valid: false,
+      error: 'Invalid AssemblyAI API key.',
+    })
+  })
+
+  it('does not declare a key invalid when the endpoint itself is unreachable', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404 }))
+    const result = await validateAssemblyAIKey('aai-key')
+    expect(result.error).toContain('Could not reach')
+    expect(result.error).not.toMatch(/invalid/i)
   })
 })
 

@@ -122,9 +122,45 @@ export async function validateAnthropicKey(apiKey: string): Promise<{ valid: boo
   }
 }
 
-export async function validateOpenAIKey(apiKey: string): Promise<{ valid: boolean; error?: string }> {
+export const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1'
+
+/**
+ * Where to probe for an OpenAI-compatible key.
+ *
+ * The 'openai' provider is also how raven talks to Gemini, Groq, OpenRouter and
+ * Ollama, via the aiBaseUrl setting. This validator used to hardcode
+ * api.openai.com, so a perfectly good Gemini key was checked against OpenAI's
+ * servers, came back 401, and Settings reported "Invalid OpenAI API key." -
+ * blaming the key for being the wrong shape for an endpoint it was never going
+ * to be sent to.
+ *
+ * /models is deliberately the same endpoint the model-list fetch uses, so
+ * validating proves the exact capability the app depends on rather than a proxy
+ * for it.
+ */
+export function openaiModelsUrl(baseUrl?: string): string {
+  const base = (baseUrl || '').trim().replace(/\/+$/, '')
+  return `${base || OPENAI_DEFAULT_BASE_URL}/models`
+}
+
+/** Host shown in errors, so the message names what actually refused the key. */
+function endpointLabel(baseUrl?: string): string {
+  const trimmed = (baseUrl || '').trim()
+  if (!trimmed) return 'OpenAI'
   try {
-    const response = await vendorGet('https://api.openai.com/v1/models', {
+    return new URL(trimmed).host
+  } catch {
+    return 'the configured endpoint'
+  }
+}
+
+export async function validateOpenAIKey(
+  apiKey: string,
+  baseUrl?: string,
+): Promise<{ valid: boolean; error?: string }> {
+  const label = endpointLabel(baseUrl)
+  try {
+    const response = await vendorGet(openaiModelsUrl(baseUrl), {
       Authorization: `Bearer ${apiKey}`,
     })
 
@@ -133,29 +169,75 @@ export async function validateOpenAIKey(apiKey: string): Promise<{ valid: boolea
     }
 
     if (response.status === 401) {
-      return { valid: false, error: 'Invalid OpenAI API key.' }
+      return { valid: false, error: `${label} rejected this API key.` }
     }
     if (response.status === 403) {
-      return { valid: false, error: 'OpenAI key does not have permission. Check your plan.' }
+      return { valid: false, error: `${label} denied access with this key. Check your plan.` }
+    }
+    // A custom endpoint that does not implement /models answers 404. That is
+    // not a bad key, and saying so would send the user to replace a working
+    // one.
+    if (response.status === 404) {
+      return {
+        valid: false,
+        error: `${label} has no /models endpoint, so the key cannot be checked here. It may still work.`,
+      }
     }
 
-    return { valid: false, error: `OpenAI returned status ${response.status}.` }
+    return { valid: false, error: `${label} returned status ${response.status}.` }
   } catch (err) {
-    return vendorUnreachable('OpenAI', err)
+    return vendorUnreachable(label, err)
   }
 }
 
+/**
+ * Probe the endpoint the app actually streams against.
+ *
+ * Previously this called GET /v2/account, which proves only that the key
+ * authenticates. Streaming is separately gated: a key that passes /v2/account
+ * can still be refused at the websocket with "Unauthorized Connection:
+ * Insufficient funds". Onboarding therefore reported the key as valid and
+ * transcription produced nothing, with no indication which of the two was
+ * wrong.
+ *
+ * Minting a short-lived streaming token exercises the same authorisation path
+ * as a real session, so a billing or entitlement problem surfaces while the
+ * user is still on the key screen. It is a GET with query params, which the
+ * shared vendorGet helper already covers - no SDK dependency here.
+ */
+const ASSEMBLYAI_STREAMING_TOKEN_URL =
+  'https://streaming.assemblyai.com/v3/token?expires_in_seconds=60'
+
 export async function validateAssemblyAIKey(apiKey: string): Promise<{ valid: boolean; error?: string }> {
   try {
-    const response = await vendorGet('https://api.assemblyai.com/v2/account', {
+    const response = await vendorGet(ASSEMBLYAI_STREAMING_TOKEN_URL, {
       authorization: apiKey,
     })
 
     if (response.ok) {
       return { valid: true }
     }
-    if (response.status === 401 || response.status === 403) {
+    if (response.status === 401) {
       return { valid: false, error: 'Invalid AssemblyAI API key.' }
+    }
+    // Distinguished from a bad key on purpose: the key is fine and the account
+    // is not. Reporting this as "invalid key" sends the user to replace a
+    // working credential, which is the mistake this rewrite exists to stop.
+    if (response.status === 402 || response.status === 403) {
+      return {
+        valid: false,
+        error:
+          'AssemblyAI accepted the key but refused streaming. Check the account has credit and '
+          + 'streaming enabled.',
+      }
+    }
+    // The endpoint moving is not evidence about the key. Saying so beats
+    // declaring a working key invalid.
+    if (response.status === 404) {
+      return {
+        valid: false,
+        error: 'Could not reach the AssemblyAI streaming endpoint to check this key.',
+      }
     }
     return { valid: false, error: `AssemblyAI returned status ${response.status}.` }
   } catch (err) {
@@ -200,10 +282,15 @@ export async function validateBothKeys(
 export async function validateKeys(
   deepgramKey: string,
   aiProvider: 'anthropic' | 'openai',
-  aiKey: string
+  aiKey: string,
+  /**
+   * The aiBaseUrl setting, when the provider is 'openai'. Passed in rather than
+   * read here so this module stays free of store coupling and testable.
+   */
+  openaiBaseUrl?: string,
 ): Promise<{ valid: boolean; error?: string; deepgramError?: string; aiError?: string }> {
   const aiValidation = aiProvider === 'openai'
-    ? validateOpenAIKey(aiKey)
+    ? validateOpenAIKey(aiKey, openaiBaseUrl)
     : validateAnthropicKey(aiKey)
 
   const [deepgramResult, aiResult] = await Promise.all([
